@@ -2,7 +2,10 @@
 # - NON modifica la logica del programma: usa SOLO funzioni/classi esistenti nel file beta.
 # - Installa SEMPRE i browser Playwright (Chromium) al primo avvio su Streamlit Cloud.
 # - Legge ANTHROPIC_API_KEY da st.secrets (fallback a .env / variabili d’ambiente).
-
+# --- bootstrap Playwright su Streamlit Cloud (auto-install browser se manca) ---
+import subprocess, os
+from playwright.sync_api import sync_playwright
+from playwright._impl._errors import Error as PWError
 import os
 import sys
 import asyncio
@@ -14,7 +17,33 @@ import subprocess
 import streamlit as st
 import os
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
+def _ensure_playwright_chromium():
+    # Evita loop: prova ad avviare una pagina usa&getta
+    try:
+        with sync_playwright() as p:
+            p.chromium.launch(headless=True).close()
+        return
+    except PWError as e:
+        # messaggio classico: "Executable doesn't exist at ... headless_shell"
+        pass
+    # Install browser + dipendenze (su Streamlit Cloud "packages.txt" copre le libs)
+    try:
+        # --with-deps è idempotente; su Cloud non serve sudo
+        subprocess.run(["playwright", "install", "chromium", "--with-deps"], check=True)
+    except Exception as e:
+        # come fallback prova senza --with-deps (alcune immagini non lo supportano)
+        try:
+            subprocess.run(["playwright", "install", "chromium"], check=True)
+        except Exception as ee:
+            # lascia risalire l’errore: lo vedrai a schermo
+            raise
 
+    # ritenta bootstrap
+    with sync_playwright() as p:
+        p.chromium.launch(headless=True).close()
+
+# Chiama questa funzione una volta, prima di creare TEStreamScraper
+_ensure_playwright_chromium()
 
 # ===== Fix event loop Playwright su Windows =====
 if sys.platform.startswith("win"):
