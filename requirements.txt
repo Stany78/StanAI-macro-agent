@@ -7,5 +7,4 @@ pandas
 pytz
 python-dotenv
 streamlit>=1.33
-playwright>=1.50,<1.56
-
+playwright

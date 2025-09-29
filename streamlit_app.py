@@ -1,111 +1,79 @@
-# streamlit_app.py — UI Streamlit per te_macro_agent_final_multi.py (versione beta)
-# - NON modifica la logica del programma: usa SOLO funzioni/classi esistenti nel file beta.
-# - Installa SEMPRE i browser Playwright (Chromium) al primo avvio su Streamlit Cloud.
-# - Legge ANTHROPIC_API_KEY da st.secrets (fallback a .env / variabili d’ambiente).
-# --- bootstrap Playwright su Streamlit Cloud (auto-install browser se manca) ---
-import subprocess, os
-from playwright.sync_api import sync_playwright
-from playwright._impl._errors import Error as PWError
+# streamlit_app.py — UI Streamlit per te_macro_agent_final_multi.py
+# - Non cambia la logica del file "beta"
+# - Installa i browser Playwright al volo se mancano (solo la prima volta)
+# - Usa SQLite/Delta Mode se le funzioni DB sono disponibili nel beta
+
 import os
 import sys
 import asyncio
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
-import subprocess
 
 import streamlit as st
-import os
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
-def _ensure_playwright_chromium():
-    # Evita loop: prova ad avviare una pagina usa&getta
-    try:
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True).close()
-        return
-    except PWError as e:
-        # messaggio classico: "Executable doesn't exist at ... headless_shell"
-        pass
-    # Install browser + dipendenze (su Streamlit Cloud "packages.txt" copre le libs)
-    try:
-        # --with-deps è idempotente; su Cloud non serve sudo
-        subprocess.run(["playwright", "install", "chromium", "--with-deps"], check=True)
-    except Exception as e:
-        # come fallback prova senza --with-deps (alcune immagini non lo supportano)
-        try:
-            subprocess.run(["playwright", "install", "chromium"], check=True)
-        except Exception as ee:
-            # lascia risalire l’errore: lo vedrai a schermo
-            raise
 
-    # ritenta bootstrap
-    with sync_playwright() as p:
-        p.chromium.launch(headless=True).close()
-
-# Chiama questa funzione una volta, prima di creare TEStreamScraper
-_ensure_playwright_chromium()
-
-# ===== Fix event loop Playwright su Windows =====
+# Fix loop async Playwright su Windows (benigno su Linux cloud)
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
 
-# ===== Import SOLO dal file beta (non modifichiamo la logica) =====
+# Import "beta" (non modifichiamo la sua logica)
 import te_macro_agent_final_multi as beta
-# Usiamo:
-# - beta.Config
-# - beta.setup_logging
-# - beta.TEStreamScraper
-# - beta.MacroSummarizer
-# - beta.build_selection(items_ctx, days, cfg, expand1_days=10, expand2_days=30)
-# - beta.save_report
 
-# ===== Config pagina =====
+# Prova a importare le funzioni DB (se non esistono nel beta, faremo fallback)
+_has_db = True
+try:
+    from te_macro_agent_final_multi import db_init, db_upsert, db_load_recent, db_prune
+except Exception:
+    _has_db = False
+
+# ---------- Config pagina ----------
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
 st.title("📈 StanAI Macro Agent")
 
-# ===== Installazione Playwright/Chromium (una sola volta per sessione) =====
+# ---------- Helper: Playwright browsers ----------
 @st.cache_resource(show_spinner=False)
-def ensure_playwright_browsers_installed() -> str:
+def ensure_playwright_browsers():
     """
-    Scarica Chromium per Playwright se non presente.
-    Esegue: python -m playwright install chromium --with-deps
-    Ritorna l'output (stdout/stderr) per diagnostica.
+    Scarica il browser Chromium di Playwright se non presente.
+    Esegue: python -m playwright install --with-deps chromium
+    Cacheremo l’esito (Streamlit Cloud usa una cache per session/job).
     """
-    try:
-        # Alcuni ambienti richiedono il path esplicito, lo lasciamo predefinito.
-        env = os.environ.copy()
-        # Esecuzione install
-        proc = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
-        return proc.stdout or "playwright install: ok"
-    except subprocess.CalledProcessError as e:
-        # Ritorno l'output per visualizzarlo in UI
-        return (e.stdout or "") + "\n[install returned non-zero exit]"
+    # Evita ripetere se già c’è la cartella target
+    default_cache = Path.home() / ".cache" / "ms-playwright"
+    chromium_dir = list(default_cache.glob("chromium*"))
+    if chromium_dir:
+        return "ok:already"
 
-# ========== UI parametri ==========
+    try:
+        # Variabili d’ambiente utili per cloud
+        env = os.environ.copy()
+        env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_cache))
+
+        cmd = [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        return "ok:installed"
+    except Exception as e:
+        return f"err:{e}"
+
+# ---------- UI: parametri ----------
 left, right = st.columns([1, 2], gap="large")
 
 with left:
     days = st.number_input("Giorni da mostrare nella SELEZIONE", min_value=1, max_value=30, value=5, step=1)
-    run_btn = st.button("Esegui pipeline")
+    run_btn = st.button("Esegui")
 
 with right:
-    st.markdown("**Seleziona i Paesi (flag):**")
+    st.markdown("**Seleziona i Paesi:**")
     countries_all = [
         "United States", "Euro Area", "Germany", "United Kingdom",
         "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
     ]
 
-    c1, c2, _ = st.columns([1, 1, 4])
+    c1, c2, _ = st.columns([1, 1, 3])
     with c1:
         select_all = st.button("Seleziona tutti")
     with c2:
@@ -134,98 +102,151 @@ with right:
 
 st.divider()
 
-# ========== Esecuzione ==========
+# ---------- RUN ----------
 if run_btn:
+    # Logging dal beta (INFO di default)
     beta.setup_logging(logging.INFO)
+
+    # Carica config dal beta (prende .env locale e/o secrets)
     cfg = beta.Config()
 
-    # 1) API KEY da st.secrets (fallback env/.env)
-    api_from_secrets = st.secrets.get("ANTHROPIC_API_KEY") if hasattr(st, "secrets") else None
-    if api_from_secrets:
-        os.environ["ANTHROPIC_API_KEY"] = api_from_secrets
-        cfg.ANTHROPIC_API_KEY = api_from_secrets
+    # Secrets su Streamlit Cloud hanno priorità: se presente, sovrascrive
+    sec_key = st.secrets.get("ANTHROPIC_API_KEY") if hasattr(st, "secrets") else None
+    if sec_key:
+        os.environ["ANTHROPIC_API_KEY"] = sec_key
+        cfg.ANTHROPIC_API_KEY = sec_key
 
+    # Controllo chiave AI
     if not cfg.ANTHROPIC_API_KEY:
-        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata in `st.secrets` o `.env`/env. Aggiungila e riprova.")
+        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata. Aggiungila in Streamlit → Settings → Secrets.")
         st.stop()
 
     if not chosen_countries:
-        st.warning("Seleziona almeno un Paese prima di eseguire.")
+        st.warning("Seleziona almeno un Paese.")
         st.stop()
 
     st.write(
         f"▶ **Contesto ES:** {cfg.CONTEXT_DAYS} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_countries)}"
     )
 
-    # 2) Installazione Playwright/Chromium PRIMA di qualsiasi scrape (obbligatoria su Cloud)
-    with st.status("Preparazione ambiente (Playwright + Chromium)…", expanded=False) as s:
-        install_log = ensure_playwright_browsers_installed()
-        s.update(label="Ambiente pronto (browser installati o già presenti).", state="complete")
-    # (facoltativo) Mostra log di installazione in expander per diagnosi
-    with st.expander("Log installazione Playwright (diagnostica)"):
-        st.code(install_log or "Nessun output")
+    # 1) Assicura Playwright browsers (solo la prima volta sul cloud)
+    with st.status("Verifica/Installazione browser Playwright…", expanded=False) as s:
+        res = ensure_playwright_browsers()
+        if res.startswith("err:"):
+            s.update(label=f"Installazione browser fallita: {res[4:]}", state="error")
+            st.stop()
+        else:
+            s.update(label="Browser Playwright pronto.", state="complete")
 
-    # 3) Scraping/Caricamento base (il tuo beta gestisce ES 60gg & DB/Delta Mode internamente)
-    try:
-        with st.status("Caricamento notizie (DB/stream)…", expanded=False) as st_status:
-            scraper = beta.TEStreamScraper(cfg)
-            items_ctx = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
-            st_status.update(
-                label=f"Base reperita. Notizie disponibili entro {cfg.CONTEXT_DAYS} gg: {len(items_ctx)}",
-                state="complete"
-            )
-    except Exception as e:
-        # Se qualcosa va storto qui, mostriamo l’errore completo.
-        st.exception(e)
-        st.stop()
+    # 2) Caricamento dati (preferisci DB se disponibile nel beta)
+    with st.status("Carico dati (DB + scraping)…", expanded=True) as s:
+        try:
+            items_ctx = []
+            used_db = False
 
-    if not items_ctx:
-        st.error("❌ Nessuna notizia disponibile entro la finestra.")
-        st.stop()
+            if getattr(cfg, "DELTA_MODE", False) and _has_db:
+                used_db = True
+                conn = db_init(cfg.DB_PATH)
 
-    # 4) Executive Summary (60gg)
-    st.info("Genero l’Executive Summary (contesto)…")
+                # Partiziona paesi in warm/fresh come nel beta main
+                warm, fresh = [], []
+                try:
+                    from te_macro_agent_final_multi import db_count_by_country
+                    for c in chosen_countries:
+                        cnt = db_count_by_country(conn, c)
+                        (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
+                except Exception:
+                    # Se non abbiamo db_count_by_country, consideriamo tutti fresh
+                    fresh = list(chosen_countries)
+
+                scraper = beta.TEStreamScraper(cfg)
+                items_new = []
+
+                if fresh:
+                    s.write(f"Warm-up nuovi paesi (≤{cfg.CONTEXT_DAYS}gg): {', '.join(fresh)}")
+                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
+
+                if warm:
+                    s.write(f"Delta scrape paesi noti (≤{cfg.SCRAPE_HORIZON_DAYS}gg): {', '.join(warm)}")
+                    items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
+
+                if items_new:
+                    db_upsert(conn, items_new)
+                    db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
+
+                items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+
+                # Fallback se DB troppo scarno
+                if len(items_ctx) < 20:
+                    s.write("Base DB scarsa — eseguo scrape completo finestra ES…")
+                    items_all = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+                    if items_all:
+                        db_upsert(conn, items_all)
+                        items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+            else:
+                scraper = beta.TEStreamScraper(cfg)
+                items_ctx = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+
+            if not items_ctx:
+                s.update(label="Nessuna notizia disponibile nell’intervallo.", state="error")
+                st.stop()
+
+            s.update(label=f"Dati caricati ({'DB+' if used_db else ''}stream). Totale elementi: {len(items_ctx)}", state="complete")
+
+        except Exception as e:
+            s.update(label=f"Errore caricamento dati: {e}", state="error")
+            st.stop()
+
+    # 3) Executive Summary (60gg)
+    st.info("Genero l’Executive Summary…")
     try:
         summarizer = beta.MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
+    except Exception as e:
+        st.error(f"Errore inizializzazione MacroSummarizer: {e}")
+        st.stop()
+
+    try:
         es_text = summarizer.executive_summary(items_ctx, cfg, chosen_countries)
     except Exception as e:
         logging.error("Errore ES: %s", e)
         es_text = "Executive Summary non disponibile per errore di generazione."
 
     st.subheader("Executive Summary")
+    if es_text.lower().startswith("executive summary non disponibile"):
+        st.warning("ES non generato. Verifica la chiave Anthropic, il modello e i limiti di token.")
     st.write(es_text)
 
-    # 5) Selezione ultimi N giorni (firma del beta richiede anche cfg)
-    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni)…")
+    # 4) Selezione ultimi N giorni (nuova firma: items, days, cfg)
+    st.info(f"Costruisco la selezione (ultimi {days} giorni)…")
     try:
-        selection_items = beta.build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
+        selection_items = beta.build_selection(items_ctx, int(days), cfg)
+    except TypeError:
+        # Fallback per vecchie versioni (firma a 2 argomenti)
+        selection_items = beta.build_selection(items_ctx, int(days))
     except Exception as e:
         st.exception(e)
         st.stop()
 
-    # 6) Traduzione titoli + Riassunti IT
+    # 5) Traduzione titoli + Riassunti IT
     st.info("Traduco i titoli e genero i riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
-
     for i, it in enumerate(selection_items, 1):
         try:
             it["title_it"] = summarizer.translate_it(it.get("title", ""), cfg)
         except Exception as e:
             logging.warning("Titolo non tradotto: %s", e)
             it["title_it"] = it.get("title", "")
-
         try:
             it["summary_it"] = summarizer.summarize_item_it(it, cfg)
         except Exception as e:
             logging.warning("Riassunto IT non disponibile: %s", e)
             it["summary_it"] = (it.get("description", "") or "")
-
         prog.progress(i / total)
 
     st.success("✅ Pipeline completata.")
 
-    # 7) Anteprima selezione
+    # 6) Anteprima selezione
     with st.expander("Anteprima Selezione (ordinata per impatto → score → recency)"):
         try:
             import pandas as pd
@@ -240,9 +261,9 @@ if run_btn:
             } for it in selection_items]
             st.dataframe(pd.DataFrame(prev_sel), use_container_width=True)
         except Exception:
-            st.info("Anteprima non disponibile (pandas mancante nel requirements).")
+            st.info("Anteprima non disponibile (pandas non installato).")
 
-    # 8) Report DOCX (firma invariata del beta)
+    # 7) Report DOCX
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
@@ -253,11 +274,9 @@ if run_btn:
             countries=chosen_countries,
             days=int(days),
             context_count=len(items_ctx),
-            output_dir=beta.Config().OUTPUT_DIR,
+            output_dir=cfg.OUTPUT_DIR,
         )
         st.info(f"Report salvato su disco: `{out_path}`")
-
-        # Download
         try:
             data = Path(out_path).read_bytes()
             st.download_button(
@@ -268,12 +287,11 @@ if run_btn:
             )
         except Exception as e:
             st.warning(f"Report creato ma non scaricabile ora: {e}")
-
     except Exception as e:
         st.error(f"Errore nella generazione/salvataggio DOCX: {e}")
 
-    # 9) Riepilogo finale
+    # 8) Riepilogo
     st.write("---")
-    st.write(f"**Notizie totali (ultimi {cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
-    st.write(f"**Notizie selezionate (ultimi {int(days)} gg + fill-up):** {len(selection_items)}")
+    st.write(f"**Notizie totali (Contesto {cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
+    st.write(f"**Notizie selezionate (ultimi {int(days)} gg):** {len(selection_items)}")
     st.caption(f"Esecuzione: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
