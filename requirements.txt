@@ -1,5 +1,4 @@
-
-anthropic>=0.30
+anthropic>=0.69.0
 python-docx
 requests
 beautifulsoup4
@@ -7,11 +6,6 @@ lxml
 pandas
 pytz
 python-dotenv
-streamlit
-playwright==1.47.2
-python-docx
-python-dateutil
-python-dotenv
-anthropic
-pandas
+streamlit>=1.33
+playwright>=1.50,<1.56
 
