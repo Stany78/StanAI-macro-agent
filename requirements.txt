@@ -1,0 +1,9 @@
+streamlit==1.38.0
+anthropic>=0.30
+python-docx
+requests
+beautifulsoup4
+lxml
+pandas
+pytz
+python-dotenv
