@@ -8,7 +8,7 @@ pandas
 pytz
 python-dotenv
 streamlit
-playwright
+playwright==1.46.0
 python-docx
 python-dateutil
 python-dotenv
