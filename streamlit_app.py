@@ -12,6 +12,9 @@ from pathlib import Path
 import subprocess
 
 import streamlit as st
+import os
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
+
 
 # ===== Fix event loop Playwright su Windows =====
 if sys.platform.startswith("win"):

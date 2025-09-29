@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -e
+
+# forza il path predefinito usato da Playwright su Streamlit Cloud
+export PLAYWRIGHT_BROWSERS_PATH=/home/appuser/.cache/ms-playwright
+
+# scarica Chromium (solo binari, le deps sono in packages.txt)
+python -m playwright install chromium
+
+# (opzionale) mostra cosa è stato installato nei log di build
+python - <<'PY'
+import os, glob, pprint
+base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH","/home/appuser/.cache/ms-playwright")
+print("Browsers dir:", base)
+print("Found:", pprint.pformat(glob.glob(base+"/*")))
+PY
