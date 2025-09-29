@@ -125,7 +125,7 @@ left, right = st.columns([1, 2], gap="large")
 
 with left:
     days = st.number_input("Giorni da mostrare nella SELEZIONE", min_value=1, max_value=30, value=5, step=1)
-    run_btn = st.button("Esegui pipeline")
+    run_btn = st.button("Esegui Report")
 
 with right:
     st.markdown("**Seleziona i Paesi (flag):**")
