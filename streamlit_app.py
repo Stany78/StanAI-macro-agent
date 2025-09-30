@@ -1,264 +1,313 @@
+# streamlit_app.py â€” UI Streamlit per te_macro_agent_final_multi.py (beta invariato)
+
 import os
 import sys
-import time
-import json
+import asyncio
 import logging
-import sqlite3
-import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
 
 import streamlit as st
+import os
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Robust bootstrap: ensure Playwright + Chromium are present at runtime
-# (idempotente: se già installati non fa nulla)
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------- Ambiente & chiavi ---------------------
 
-def ensure_playwright_chromium():
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+# Fix loop async Playwright su Windows
+if sys.platform.startswith("win"):
     try:
-        import playwright  # noqa: F401
-    except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])  # light-weight
-    # assicura i binari del browser (con fallback senza --with-deps)
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+# Carica .env in locale; in Cloud useremo st.secrets come fallback
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+except Exception:
+    pass
+
+# Se la chiave non Ã¨ in env ma esiste in st.secrets, copiala in os.environ
+if "ANTHROPIC_API_KEY" not in os.environ:
     try:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"]) 
-    except subprocess.CalledProcessError:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"]) 
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Importa l'agente macro SENZA MODIFICARLO
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------- Import del beta (non modificare la logica) ---------------------
+import te_macro_agent_final_multi as beta
 from te_macro_agent_final_multi import (
     Config,
+    setup_logging,
     TEStreamScraper,
     MacroSummarizer,
-    db_init,
-    db_upsert,
-    db_prune,
-    db_load_recent,
     build_selection,
     save_report,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility UI
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------- Bootstrap Playwright in Cloud ---------------------
+import subprocess
+import pathlib
 
-def get_api_key_from_env_or_ui() -> str:
-    # Priorità: secrets → env → input utente
-    key = st.secrets.get("ANTHROPIC_API_KEY", None) if hasattr(st, "secrets") else None
-    if not key:
-        key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        with st.sidebar:
-            key = st.text_input("ANTHROPIC_API_KEY", type="password", help="Inserisci la tua API key Anthropic")
-    return key or ""
+@st.cache_resource(show_spinner=False)
+def ensure_playwright_chromium():
+    """
+    In Cloud i browser di Playwright non sono persistenti.
+    Questa funzione installa Chromium se manca. Ãˆ idempotente.
+    """
+    cache_dir = pathlib.Path.home() / ".cache" / "ms-playwright"
+    chromium_ok = False
+    if cache_dir.exists():
+        # presenza di una cartella chromium/headless_shell vale come installato
+        for p in cache_dir.rglob("*"):
+            try:
+                if p.name.startswith("chromium"):
+                    chromium_ok = True
+                    break
+            except Exception:
+                pass
+    if not chromium_ok:
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "--with-deps", "chromium"],
+            check=True
+        )
 
+# --------------------- UI ---------------------
+st.set_page_config(page_title="StanAI Macro Agent", page_icon="ðŸ“ˆ", layout="wide")
+st.title("ðŸ“ˆ StanAI Macro Agent")
 
-def countries_menu(cfg: Config) -> List[str]:
-    default = ["United States", "Euro Area"]
-    all_countries = cfg.DEFAULT_COUNTRIES_MENU
-    return st.multiselect(
-        "Seleziona i Paesi (finestra ES = 60 giorni)",
-        options=all_countries,
-        default=default,
-    )
+left, right = st.columns([1, 2], gap="large")
 
+with left:
+    days = st.number_input("Giorni da mostrare nella SELEZIONE", min_value=1, max_value=30, value=5, step=1)
+    run_btn = st.button("Esegui pipeline")
 
-def render_selection_table(rows: List[Dict[str, Any]]):
-    import pandas as pd
-    if not rows:
-        st.info("Nessun elemento nella selezione.")
-        return
-    # colonne utili e ordine leggibile
-    cols = [
-        "country", "time", "category_mapped", "importance", "score",
-        "title_it", "title", "summary_it", "age_days"
+with right:
+    st.markdown("**Seleziona i Paesi:**")
+    countries_all = [
+        "United States", "Euro Area", "Germany", "United Kingdom",
+        "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
     ]
-    # normalizza
-    norm = []
-    for r in rows:
-        d = {k: r.get(k) for k in cols}
-        norm.append(d)
-    df = pd.DataFrame(norm)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        select_all = st.button("Seleziona tutti")
+    with c2:
+        deselect_all = st.button("Deseleziona tutti")
 
+    if "country_flags" not in st.session_state:
+        st.session_state.country_flags = {c: False for c in countries_all}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App Streamlit
-# ──────────────────────────────────────────────────────────────────────────────
+    if select_all:
+        for c in countries_all:
+            st.session_state.country_flags[c] = True
+    if deselect_all:
+        for c in countries_all:
+            st.session_state.country_flags[c] = False
 
-def main():
-    st.set_page_config(page_title="TE Macro Agent — AutoSelect", layout="wide")
-    st.title("🏦 Macro Markets Analysis — AutoSelect (ES 60gg + Delta DB)")
+    cols = st.columns(2)
+    for i, c in enumerate(countries_all):
+        col = cols[i % 2]
+        st.session_state.country_flags[c] = col.checkbox(
+            c,
+            value=st.session_state.country_flags.get(c, False),
+            key=f"chk_{c}"
+        )
 
-    ensure_playwright_chromium()
+    chosen_countries = [c for c, v in st.session_state.country_flags.items() if v]
 
-    # Config di base dal modulo
+st.divider()
+
+# --------------------- Esecuzione ---------------------
+if run_btn:
+    setup_logging(logging.INFO)
     cfg = Config()
-    cfg.HEADLESS = True
 
-    # Sidebar: chiave API, modalità delta, cartella output
-    with st.sidebar:
-        st.header("Impostazioni")
-        api_key = get_api_key_from_env_or_ui()
-        cfg.ANTHROPIC_API_KEY = api_key
-
-        cfg.DELTA_MODE = st.toggle("Delta Mode (DB + stream)", value=True, help="Velocizza aggiornando solo i paesi già presenti in DB")
-        cfg.SCRAPE_HORIZON_DAYS = st.slider("Scrape orizzonte (giorni)", 3, 14, value=7)
-        cfg.PRUNE_DAYS = st.slider("Prune DB (giorni)", 30, 90, value=60)
-
-        # path DB e output nella working dir dell'app
-        workdir = Path.cwd()
-        cfg.DB_PATH = str(workdir / "news_cache.sqlite")
-        cfg.OUTPUT_DIR = str(workdir)
-        st.caption(f"DB Path: {cfg.DB_PATH}")
-
-    # Parametri run
-    selection_days = st.slider("Mostra notizie degli ultimi N giorni", min_value=1, max_value=30, value=7)
-    chosen_countries = countries_menu(cfg)
-
-    col1, col2, col3 = st.columns([1,1,1])
-    go = col1.button("🚀 Esegui analisi")
-    do_scrape_only = col2.button("🧹 Solo aggiorna DB (scrape)")
-    do_clear = col3.button("🗑️ Pulisci DB (prune immediato)")
-
-    # Se l'utente vuole solo pulire il DB
-    if do_clear:
-        conn = db_init(cfg.DB_PATH)
-        db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
-        conn.close()
-        st.success("DB ripulito.")
-        st.stop()
-
-    if not (go or do_scrape_only):
-        st.info("Imposta i parametri e premi **Esegui analisi** oppure **Solo aggiorna DB**.")
-        st.stop()
-
+    # Verifica chiave
     if not cfg.ANTHROPIC_API_KEY:
-        st.error("ANTHROPIC_API_KEY mancante. Inseriscila nei Secrets o nella sidebar.")
+        st.error("âŒ Nessuna ANTHROPIC_API_KEY trovata (.env o Secrets).")
         st.stop()
 
-    # Log area
-    log_area = st.empty()
-    def log(msg: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        log_area.info(f"[{ts}] {msg}")
+    if not chosen_countries:
+        st.warning("Seleziona almeno un Paese prima di eseguire.")
+        st.stop()
 
-    # Avvio
-    start_ts = time.time()
-    log("Inizializzo DB…")
-    conn = db_init(cfg.DB_PATH)
+    st.write(f"â–¶ **Contesto ES:** {cfg.CONTEXT_DAYS} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_countries)}")
 
+    # Assicura i browser Playwright in Cloud
+    with st.status("Preparazione ambiente browserâ€¦", expanded=False) as st_status:
+        try:
+            ensure_playwright_chromium()
+            st_status.update(label="Browser pronto", state="complete")
+        except Exception as e:
+            st.exception(e)
+            st.stop()
+
+    # ---- Pipeline dati con DB (Delta Mode dal beta) ----
+    st.info("Carico/aggiorno database locale (Delta Mode)â€¦")
+    items_ctx = []
     try:
-        # Warm/Delta logic + scraping
-        from te_macro_agent_final_multi import TEStreamScraper, db_count_by_country
-        scraper = TEStreamScraper(cfg)
-
-        if do_scrape_only:
-            log("Eseguo scraping completo (DeltaMode rispetta la finestra ridotta per paesi caldi)…")
-        else:
-            log("Preparo contesto ES e selezione…")
-
-        items_new: List[Dict[str, Any]] = []
-        items_ctx: List[Dict[str, Any]] = []
-
         if cfg.DELTA_MODE:
-            # determinazione paesi "caldi" (già in DB) vs "freschi"
+            conn = beta.db_init(cfg.DB_PATH)
+
             warm, fresh = [], []
             for c in chosen_countries:
-                cnt = db_count_by_country(conn, c)
+                cnt = beta.db_count_by_country(conn, c)
                 (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
 
+            items_new = []
+            scraper = TEStreamScraper(cfg)
+
             if fresh:
-                log(f"Scrape iniziale (<= {cfg.CONTEXT_DAYS} gg) per nuovi paesi: {', '.join(fresh)}")
-                items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
+                with st.status(f"Scraping iniziale (â‰¤{cfg.CONTEXT_DAYS}gg): {', '.join(fresh)}", expanded=False) as s1:
+                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
+                    s1.update(label="Scraping iniziale completato", state="complete")
+
             if warm:
-                log(f"Delta scrape (<= {cfg.SCRAPE_HORIZON_DAYS} gg) per paesi caldi: {', '.join(warm)}")
-                items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
+                with st.status(f"Scraping delta (â‰¤{cfg.SCRAPE_HORIZON_DAYS}gg): {', '.join(warm)}", expanded=False) as s2:
+                    items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
+                    s2.update(label="Scraping delta completato", state="complete")
 
             if items_new:
-                db_upsert(conn, items_new)
-                db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
+                beta.db_upsert(conn, items_new)
+                beta.db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
 
-            items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+            items_ctx = beta.db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
 
-            if not items_ctx or len(items_ctx) < 20:
-                log("Base DB scarsa: fallback a scrape completo finestra ES per tutti i paesi scelti…")
-                items_all = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
-                if items_all:
-                    db_upsert(conn, items_all)
-                    items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+            # Fallback se base scarsa
+            if len(items_ctx) < 20:
+                with st.status(f"Base scarsa ({len(items_ctx)}). Scraping completo (â‰¤{cfg.CONTEXT_DAYS}gg)â€¦", expanded=False) as s3:
+                    items_all = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+                    if items_all:
+                        beta.db_upsert(conn, items_all)
+                        items_ctx = beta.db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+                    s3.update(label="Scraping completo terminato", state="complete")
         else:
-            log("Scrape diretto (no DB delta)…")
-            items_ctx = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+            with st.status(f"Scraping (â‰¤{cfg.CONTEXT_DAYS}gg)â€¦", expanded=False) as s4:
+                scraper = TEStreamScraper(cfg)
+                items_ctx = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+                s4.update(label="Scraping completato", state="complete")
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
-        if not items_ctx:
-            st.error("Nessuna notizia disponibile nella finestra temporale.")
-            st.stop()
+    if not items_ctx:
+        st.error("âŒ Nessuna notizia disponibile nella finestra temporale.")
+        st.stop()
 
-        if do_scrape_only:
-            st.success(f"DB aggiornato. Notizie in contesto: {len(items_ctx)}")
-            render_selection_table(items_ctx)
-            st.stop()
+    # Anteprima contesto
+    with st.expander("Anteprima contesto (prime 50)"):
+        try:
+            import pandas as pd
+            df_prev = [{
+                "time": x.get("time",""),
+                "age_days": x.get("age_days",""),
+                "country": x.get("country",""),
+                "importance": x.get("importance",0),
+                "category_raw": x.get("category_raw",""),
+                "title": (x.get("title","") or "")[:140],
+            } for x in items_ctx[:50]]
+            st.dataframe(pd.DataFrame(df_prev), use_container_width=True)
+        except Exception:
+            st.caption("Anteprima non disponibile (pandas non presente).")
 
-        # Executive Summary
-        log("Genero Executive Summary (Anthropic)…")
+    # ---- Executive Summary ----
+    st.info("Genero lâ€™Executive Summaryâ€¦")
+    try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
+    except Exception as e:
+        st.error(f"Errore inizializzazione MacroSummarizer: {e}")
+        st.stop()
+
+    try:
         es_text = summarizer.executive_summary(items_ctx, cfg, chosen_countries)
+    except Exception as e:
+        logging.error("Errore ES: %s", e)
+        es_text = "Executive Summary non disponibile per errore di generazione."
 
-        # Selezione ultimi N giorni + fill-up
-        log("Costruisco selezione (ultimi N giorni + fill-up)…")
-        selection_items = build_selection(items_ctx, selection_days, cfg, expand1_days=10, expand2_days=30)
+    st.subheader("Executive Summary")
+    st.write(es_text)
 
-        # Traduzioni & riassunti IT per i selezionati
-        log("Traduco titoli e creo riassunti brevi in IT…")
-        for it in selection_items:
-            try:
-                it["title_it"] = summarizer.translate_it(it.get("title", ""), cfg)
-            except Exception:
-                it["title_it"] = it.get("title", "")
-            try:
-                it["summary_it"] = summarizer.summarize_item_it(it, cfg)
-            except Exception:
-                it["summary_it"] = (it.get("description", "") or "")
+    # ---- Selezione ultimi N giorni (usa la firma del beta: richiede cfg) ----
+    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni)â€¦")
+    try:
+        selection_items = build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
+    except TypeError:
+        # retro-compatibilitÃ  se il beta avesse build_selection(items, days) senza cfg
+        selection_items = build_selection(items_ctx, int(days))
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
-        # Report DOCX + download
+    # ---- Traduzione titoli + Riassunti IT ----
+    st.info("Traduco i titoli e genero i riassunti in italianoâ€¦")
+    prog = st.progress(0.0)
+    total = max(1, len(selection_items))
+    for i, it in enumerate(selection_items, 1):
+        try:
+            it["title_it"] = summarizer.translate_it(it.get("title",""), cfg)
+        except Exception as e:
+            logging.warning("Titolo non tradotto: %s", e)
+            it["title_it"] = it.get("title","")
+
+        try:
+            it["summary_it"] = summarizer.summarize_item_it(it, cfg)
+        except Exception as e:
+            logging.warning("Riassunto IT non disponibile: %s", e)
+            it["summary_it"] = (it.get("description","") or "")
+        prog.progress(i / total)
+
+    st.success("âœ… Pipeline completata.")
+
+    # ---- Anteprima selezione ----
+    with st.expander("Anteprima selezione (ordinata per impatto, score, recency)"):
+        try:
+            import pandas as pd
+            df_sel = [{
+                "time": it.get("time",""),
+                "age_days": it.get("age_days",""),
+                "country": it.get("country",""),
+                "importance": it.get("importance",0),
+                "score": it.get("score",0),
+                "category": it.get("category_mapped",""),
+                "title_it": (it.get("title_it","") or "")[:120],
+            } for it in selection_items]
+            st.dataframe(pd.DataFrame(df_sel), use_container_width=True)
+        except Exception:
+            st.caption("Anteprima non disponibile (pandas non presente).")
+
+    # ---- Report DOCX ----
+    try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
-        filename = f"MacroAnalysis_AutoSelect_{selection_days}days_{ts}.docx"
-        out_path = save_report(filename, es_text, selection_items, chosen_countries, selection_days, len(items_ctx), cfg.OUTPUT_DIR)
+        filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
+        out_path = save_report(
+            filename=filename,
+            es_text=es_text,
+            selection=selection_items,
+            countries=chosen_countries,
+            days=int(days),
+            context_count=len(items_ctx),
+            output_dir=cfg.OUTPUT_DIR,
+        )
+        st.info(f"Report salvato su disco: `{out_path}`")
 
-        # Output UI
-        st.subheader("Executive Summary")
-        st.write(es_text or "(non disponibile)")
-
-        st.subheader("Notizie selezionate")
-        render_selection_table(selection_items)
-
-        # Download del report
-        with open(out_path, "rb") as f:
+        # Download
+        try:
+            data = Path(out_path).read_bytes()
             st.download_button(
-                label="📄 Scarica report DOCX",
-                data=f.read(),
+                "ðŸ“¥ Scarica report DOCX",
+                data=data,
                 file_name=Path(out_path).name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-
-        elapsed = time.time() - start_ts
-        st.success(f"Completato in {elapsed:.1f}s — elementi in contesto: {len(items_ctx)} · selezione: {len(selection_items)}")
+        except Exception as e:
+            st.warning(f"Report creato ma non scaricabile ora: {e}")
 
     except Exception as e:
-        st.exception(e)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        st.error(f"Errore nella generazione/salvataggio DOCX: {e}")
 
-
-if __name__ == "__main__":
-    main()
+    # ---- Riepilogo finale ----
+    st.write("---")
+    st.write(f"**Notizie totali (Contesto {cfg.CONTEXT_DAYS}gg, DB+stream):** {len(items_ctx)}")
+    st.write(f"**Notizie selezionate (ultimi {int(days)} gg + fill-up):** {len(selection_items)}")
+    st.caption(f"Esecuzione: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
