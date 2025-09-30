@@ -1,4 +1,0 @@
-#!/bin/bash
-pip install playwright==1.47.0
-playwright install --with-deps chromium
-
