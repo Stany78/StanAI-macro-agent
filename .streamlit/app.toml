@@ -1,0 +1,8 @@
+[build]
+postInstall = ".streamlit/scripts/postinstall.sh"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
