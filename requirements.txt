@@ -1,4 +1,4 @@
-# runtime
+# App + runtime
 streamlit>=1.36,<1.41
 playwright==1.48.0
 pandas>=2.2
@@ -8,9 +8,16 @@ python-dotenv>=1.0
 tenacity>=8.4
 anthropic>=0.36
 
-# toolchain per evitare build da sorgente (greenlet)
+# Web + parsing (comuni per scraping/API)
+requests>=2.32
+beautifulsoup4>=4.12
+lxml>=5.3
+
+# SQL stack (greenlet pin to avoid source build on Streamlit Cloud)
+SQLAlchemy==2.0.36
+greenlet==3.1.1
+
+# Build tooling (avoid source builds sneaking in)
 pip==25.2
 setuptools>=75
 wheel>=0.44
-greenlet==3.1.1
-SQLAlchemy==2.0.36
