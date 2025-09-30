@@ -1,4 +1,5 @@
 # NO COMMENTS ALLOWED IN THIS FILE. One package per line.
+chromium
 libnss3
 libatk-bridge2.0-0
 libxkbcommon0
