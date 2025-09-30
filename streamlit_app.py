@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import os
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
 
 # --------------------- Ambiente & chiavi ---------------------
 

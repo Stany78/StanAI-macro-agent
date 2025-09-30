@@ -1,7 +1,7 @@
-playwright==1.55.0
-python-docx
+streamlit>=1.37
+playwright>=1.46,<1.49
 python-dotenv
+python-dateutil
+python-docx
 pandas
-streamlit
-anthropic
-lxml
+

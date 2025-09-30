@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -e
 
-# Usa il python corretto del venv
-PYBIN="$(python -c 'import sys; print(sys.executable)')"
+echo "▶ Updating pip & installing Playwright in the app venv"
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade playwright
 
-# Ripulisce la cache corrotta di Playwright (se esiste)
-rm -rf /home/appuser/.cache/ms-playwright || true
+echo "▶ Installing Chromium browser for Playwright"
+python -m playwright install --with-deps chromium
 
-# Installa Playwright dentro il venv
-"$PYBIN" -m pip install --upgrade --no-cache-dir playwright
-
-# Installa Chromium e le dipendenze
-export PLAYWRIGHT_BROWSERS_PATH=0
-"$PYBIN" -m playwright install --with-deps chromium
+echo "✅ Post-install done"
