@@ -1,7 +1,5 @@
-streamlit>=1.37
-playwright>=1.44
-python-dotenv
-python-dateutil
-python-docx
-pandas
-anthropic
+streamlit==1.37.1
+python-docx==1.1.2
+python-dotenv==1.0.1
+python-dateutil==2.9.0.post0
+playwright==1.46.0
