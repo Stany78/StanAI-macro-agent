@@ -1,5 +1,5 @@
 streamlit>=1.37
-playwright>=1.47
+playwright>=1.44
 python-dotenv
 python-dateutil
 python-docx
