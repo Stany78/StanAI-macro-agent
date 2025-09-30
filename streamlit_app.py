@@ -8,7 +8,30 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-import os
+import os, sys, subprocess
+
+# facoltativo: usa la cartella di default del runtime (più portabile su Streamlit Cloud)
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
+def ensure_playwright_chromium():
+    """Garantisce che il modulo playwright e i binari di Chromium siano presenti.
+    Idempotente: se è già tutto installato, non fa nulla."""
+    try:
+        # 1) modulo python presente?
+        import playwright  # noqa: F401
+    except ModuleNotFoundError:
+        # installa il pacchetto nel venv dell’app
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
+    # 2) assicura i binari del browser (non solleva se già presenti)
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
+    except subprocess.CalledProcessError:
+        # su alcuni ambienti le deps di sistema sono già presenti: riprova senza --with-deps
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+# chiamala subito, prima di usare playwright o fare scraping
+ensure_playwright_chromium()
+
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/home/appuser/.cache/ms-playwright")
 
 # --------------------- Ambiente & chiavi ---------------------

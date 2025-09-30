@@ -1,4 +1,4 @@
-# --- Core app deps ---
+# runtime
 streamlit>=1.36,<1.41
 playwright==1.48.0
 pandas>=2.2
@@ -6,15 +6,11 @@ python-docx>=1.1
 python-dateutil>=2.9
 python-dotenv>=1.0
 tenacity>=8.4
-
-# --- LLM client ---
 anthropic>=0.36
 
-# --- Avoid building from source on Streamlit Cloud ---
+# toolchain per evitare build da sorgente (greenlet)
 pip==25.2
 setuptools>=75
 wheel>=0.44
-
-# --- Force prebuilt greenlet wheel to avoid compile failures ---
 greenlet==3.1.1
 SQLAlchemy==2.0.36
