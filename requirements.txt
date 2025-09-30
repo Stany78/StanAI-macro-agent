@@ -1,13 +1,8 @@
-# --- Toolchain (per evitare errori di build) ---
 pip==25.2
 setuptools>=75
 wheel>=0.44
-
-# --- Database stack ---
 SQLAlchemy==2.0.36
 greenlet==3.1.1
-
-# --- Core app ---
 streamlit>=1.36,<1.41
 playwright==1.48.0
 pandas>=2.2
@@ -16,9 +11,6 @@ python-dateutil>=2.9
 python-dotenv>=1.0
 tenacity>=8.4
 anthropic>=0.36
-
-# --- Web & parsing ---
 requests>=2.32
 beautifulsoup4>=4.12
 lxml>=5.3
-

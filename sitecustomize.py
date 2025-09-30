@@ -1,8 +1,7 @@
-# Auto-install Playwright browsers at interpreter startup (works on Streamlit Cloud).
-# Put this file in the project root. Python auto-imports "sitecustomize" if present on sys.path.
+# Auto-install Playwright browsers at interpreter startup (no changes to your app needed).
 import os, sys, subprocess, pathlib
 
-# Where Playwright caches browsers on Streamlit Cloud
+# Usa la stessa path che vedi nell'errore
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(pathlib.Path.home() / ".cache" / "ms-playwright"))
 
 def _chromium_installed(base: pathlib.Path) -> bool:
@@ -20,12 +19,11 @@ def _ensure_playwright_chromium():
     try:
         import playwright  # noqa: F401
     except Exception:
-        # Playwright package not installed -> requirements.txt must include "playwright"
+        # Playwright non installato: assicurati che sia in requirements.txt
         return
     base = pathlib.Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
     if _chromium_installed(base):
         return
-    # Try with deps first; if the image already has deps, fallback without
     cmds = [
         [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
         [sys.executable, "-m", "playwright", "install", "chromium"],
@@ -38,3 +36,4 @@ def _ensure_playwright_chromium():
             continue
 
 _ensure_playwright_chromium()
+
