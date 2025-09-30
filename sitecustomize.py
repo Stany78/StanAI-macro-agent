@@ -1,9 +1,11 @@
-# Auto-setup for Playwright browsers on Streamlit Cloud without touching app code.
-# Python auto-imports this module if present on sys.path (see `site` docs).
+# Auto-install Playwright browsers at interpreter startup (works on Streamlit Cloud).
+# Put this file in the project root. Python auto-imports "sitecustomize" if present on sys.path.
 import os, sys, subprocess, pathlib
 
-def _chromium_installed() -> bool:
-    base = pathlib.Path.home() / ".cache" / "ms-playwright"
+# Where Playwright caches browsers on Streamlit Cloud
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(pathlib.Path.home() / ".cache" / "ms-playwright"))
+
+def _chromium_installed(base: pathlib.Path) -> bool:
     if not base.exists():
         return False
     try:
@@ -18,28 +20,21 @@ def _ensure_playwright_chromium():
     try:
         import playwright  # noqa: F401
     except Exception:
-        return  # playwright non installato via pip -> nessuna azione
-    if _chromium_installed():
+        # Playwright package not installed -> requirements.txt must include "playwright"
         return
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-        )
-    except Exception:
-        # Fallback senza --with-deps (su ambienti dove le deps APT sono già presenti)
+    base = pathlib.Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+    if _chromium_installed(base):
+        return
+    # Try with deps first; if the image already has deps, fallback without
+    cmds = [
+        [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+    ]
+    for cmd in cmds:
         try:
-            subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-            )
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            break
         except Exception:
-            pass  # come ultima spiaggia, lascia proseguire: l'app potrà gestire l'errore
+            continue
 
-# Evita di fare lavoro inutile in dev locale ripetutamente
-if os.environ.get("STREAMLIT_CLOUD", "1") == "1" or os.environ.get("WEBSERVICE_PLATFORM","") == "streamlit":
-    _ensure_playwright_chromium()
+_ensure_playwright_chromium()
