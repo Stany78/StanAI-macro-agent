@@ -10,3 +10,5 @@ python -m pip install "playwright>=1.50,<1.56"
 # scarica i binari dei browser necessari a playwright
 python -m playwright install --with-deps chromium
 
+#!/bin/bash
+python -m playwright install --with-deps chromium

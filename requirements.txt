@@ -1,10 +1,7 @@
-anthropic>=0.69.0
-python-docx
-requests
-beautifulsoup4
-lxml
-pandas
-pytz
-python-dotenv
-streamlit>=1.33
+streamlit
 playwright
+python-docx
+python-dotenv
+anthropic
+pandas
+python-dateutil
