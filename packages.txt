@@ -1,3 +1,4 @@
+chromium
 libnss3
 libx11-6
 libx11-xcb1
@@ -19,5 +20,4 @@ libasound2
 libcurl4
 ca-certificates
 fonts-liberation
-chromium
 

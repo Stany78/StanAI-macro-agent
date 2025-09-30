@@ -1,14 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# assicura pip recente (facoltativo ma utile)
-python -m pip install --upgrade pip
-
-# garantisci la stessa fascia di versioni di requirements
-python -m pip install "playwright>=1.50,<1.56"
-
-# scarica i binari dei browser necessari a playwright
-python -m playwright install --with-deps chromium
-
 #!/bin/bash
+set -e
+python -m pip install --upgrade pip wheel
 python -m playwright install --with-deps chromium
+
