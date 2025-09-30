@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -e
-
-# Aggiorna pip (opzionale ma utile)
-python -m pip install --upgrade pip
-
-# Installa SOLO i browser (le dipendenze di sistema le gestisce packages.txt)
-python -m playwright install chromium
-
