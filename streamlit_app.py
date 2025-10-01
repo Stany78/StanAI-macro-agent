@@ -1,17 +1,19 @@
-# streamlit_app.py — versione definitiva con bootstrap Playwright integrato
-# - Non modifica la logica del modulo beta: usa le funzioni/classi esistenti
-# - Aggiunge un bootstrap robusto per Playwright (libreria + browser Chromium)
-# - Mantiene la pipeline DB/Delta Mode, Executive Summary e report DOCX
+# streamlit_app.py — versione con bootstrap Playwright + retry Anthropic
+# - NON modifica la logica del modulo beta (usiamo le sue funzioni/classi così come sono)
+# - Executive Summary: input identico al locale (usa items_ctx, nessun filtro/troncatura)
+# - Aggiunge: ensure_playwright_chromium(), retry/backoff sui 429 e single-flight per evitare doppie chiamate
 
 import os
 import sys
 import asyncio
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 
 import streamlit as st
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_message
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compatibilità event loop Windows (no-op in Cloud)
@@ -33,6 +35,7 @@ from te_macro_agent_final_multi import (
     MacroSummarizer,
     build_selection,
     save_report,
+    # DB helpers
     db_init, db_upsert, db_count_by_country, db_load_recent, db_prune,
 )
 
@@ -47,26 +50,60 @@ def ensure_playwright_chromium() -> None:
       2) i binari Chromium siano installati in ~/.cache/ms-playwright
     È idempotente e veloce ai run successivi.
     """
-    # Installa la libreria se assente
+    # 1) Installa la libreria se assente
     try:
         import playwright  # noqa: F401
     except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])  # pin stabile
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
 
-    # Imposta la stessa path vista nei log di errore
+    # 2) Imposta la stessa path vista nei log di errore
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
 
     base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
     chromium_present = base.exists() and any(p.name.startswith("chromium") for p in base.glob("chromium-*"))
 
+    # 3) Se Chromium non è presente, scaricalo (prima con --with-deps, poi fallback)
     if not chromium_present:
-        # Primo tentativo: con deps di sistema
+        try:
+            subprocess.check_check_call  # help IDE find name error early
+        except AttributeError:
+            # older runtimes may not have this attr; ignore
+            pass
         try:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
         except subprocess.CalledProcessError:
-            # Fallback: senza --with-deps (su container che hanno già le deps APT)
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: retry 429 Anthropic + single-flight per evitare doppie chiamate
+# ──────────────────────────────────────────────────────────────────────────────
+def _retryable(fn, *args, **kwargs):
+    """
+    Esegue fn con retry/backoff sui classici errori 429 / rate limit di Anthropic.
+    Non cambia l'input né l'output del modello: solo ritenta.
+    """
+    @retry(
+        reraise=True,
+        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit)"),
+        wait=wait_exponential(multiplier=1.5, min=2, max=30),
+        stop=stop_after_attempt(5),
+    )
+    def _call():
+        return fn(*args, **kwargs)
+    return _call()
+
+def call_once_per_run(cache_key: str, caller):
+    """
+    Evita invii doppi dovuti a rerun di Streamlit.
+    Se nel run corrente abbiamo già calcolato cache_key, ritorna il valore cached.
+    """
+    if "api_once_cache" not in st.session_state:
+        st.session_state.api_once_cache = {}
+    if cache_key in st.session_state.api_once_cache:
+        return st.session_state.api_once_cache[cache_key]
+    val = caller()
+    st.session_state.api_once_cache[cache_key] = val
+    return val
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
@@ -85,6 +122,7 @@ with left:
 
 with right:
     st.markdown("**Seleziona i Paesi:**")
+    # Menu paesi coerente con il beta
     countries_all = [
         "United States", "Euro Area", "Germany", "United Kingdom",
         "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
@@ -198,11 +236,15 @@ if run_btn:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary
+    # Executive Summary — **identico al locale** (stessi input)
     st.info("Genero l’Executive Summary…")
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
-        es_text = summarizer.executive_summary(items_ctx, cfg, chosen_norm)
+        # chiave cache basata su dimensione contesto + paesi + finestra (solo anti-rerun)
+        es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS}"
+        es_text = call_once_per_run(es_cache_key, lambda: _retryable(
+            summarizer.executive_summary, items_ctx, cfg, chosen_norm
+        ))
     except Exception as e:
         st.exception(e)
         es_text = "Executive Summary non disponibile per errore di generazione."
@@ -210,7 +252,7 @@ if run_btn:
     st.subheader("Executive Summary")
     st.write(es_text)
 
-    # Selezione ultimi N giorni (+ fill-up)
+    # Selezione ultimi N giorni (+ fill-up) — come da beta
     st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, con fill-up se necessario)…")
     try:
         selection_items = build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
@@ -220,25 +262,35 @@ if run_btn:
         st.exception(e)
         st.stop()
 
-    # Traduzione titoli + Riassunti IT
+    # Traduzione titoli + Riassunti IT — input identico, solo retry e piccola pausa
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
 
     for i, it in enumerate(selection_items, 1):
+        # Traduzione titolo (retry 429)
         try:
-            it["title_it"] = summarizer.translate_it(it.get("title", ""), cfg)
+            it["title_it"] = call_once_per_run(f"ti::{hash(it.get('title',''))}", lambda: _retryable(
+                summarizer.translate_it, it.get("title",""), cfg
+            ))
         except Exception:
-            it["title_it"] = it.get("title", "") or ""
+            it["title_it"] = it.get("title","") or ""
+
+        # Riassunto IT (retry 429)
         try:
-            it["summary_it"] = summarizer.summarize_item_it(it, cfg)
+            it["summary_it"] = call_once_per_run(f"si::{hash((it.get('title',''), it.get('time','')))}", lambda: _retryable(
+                summarizer.summarize_item_it, it, cfg
+            ))
         except Exception:
-            it["summary_it"] = (it.get("description", "") or "")
+            it["summary_it"] = (it.get("description","") or "")
+
+        # Pausa “gentile” per smussare picchi (non cambia il contenuto)
+        time.sleep(0.2)
         prog.progress(i / total)
 
     st.success("✅ Pipeline completata.")
 
-    # Anteprima selezione
+    # Anteprima Selezione
     with st.expander("Anteprima Selezione"):
         try:
             import pandas as pd
