@@ -1,7 +1,7 @@
-# streamlit_app.py — versione con bootstrap Playwright + retry Anthropic
-# - NON modifica la logica del modulo beta (usiamo le sue funzioni/classi così come sono)
-# - Executive Summary: input identico al locale (usa items_ctx, nessun filtro/troncatura)
-# - Aggiunge: ensure_playwright_chromium(), retry/backoff sui 429 e single-flight per evitare doppie chiamate
+# streamlit_app.py — bootstrap Playwright + retry Anthropic + pacing adattivo ES
+# - NON modifica la logica del modulo beta
+# - ES: input identico al locale (usa items_ctx, nessun filtro/troncatura)
+# - Aggiunge: ensure_playwright_chromium(), retry/backoff 429, single-flight anti-rerun, pacing prima dell'ES
 
 import os
 import sys
@@ -56,7 +56,7 @@ def ensure_playwright_chromium() -> None:
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
 
-    # 2) Imposta la stessa path vista nei log di errore
+    # 2) Imposta la path vista nei log di errore
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
 
     base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
@@ -65,17 +65,12 @@ def ensure_playwright_chromium() -> None:
     # 3) Se Chromium non è presente, scaricalo (prima con --with-deps, poi fallback)
     if not chromium_present:
         try:
-            subprocess.check_check_call  # help IDE find name error early
-        except AttributeError:
-            # older runtimes may not have this attr; ignore
-            pass
-        try:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
         except subprocess.CalledProcessError:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helper: retry 429 Anthropic + single-flight per evitare doppie chiamate
+# Helper: retry 429 Anthropic + single-flight + pacing adattivo (senza cambiare input)
 # ──────────────────────────────────────────────────────────────────────────────
 def _retryable(fn, *args, **kwargs):
     """
@@ -104,6 +99,38 @@ def call_once_per_run(cache_key: str, caller):
     val = caller()
     st.session_state.api_once_cache[cache_key] = val
     return val
+
+def _rough_token_estimate(items):
+    """Stima grossolana dei token in input (~1 token ogni 4 caratteri)."""
+    total_chars = 0
+    for it in items:
+        total_chars += len(it.get("title", "") or "")
+        total_chars += len(it.get("description", "") or "")
+    return max(1, total_chars // 4)
+
+def pace_before_big_request(items, label="Preparazione Executive Summary…"):
+    """
+    Attesa adattiva prima di inviare richieste molto grandi, per rientrare
+    nel rate limit 'acceleration' di Anthropic senza cambiare l'input.
+    """
+    est_tokens = _rough_token_estimate(items)
+    if est_tokens < 30000:
+        wait_s = 0
+    elif est_tokens < 60000:
+        wait_s = 8
+    elif est_tokens < 90000:
+        wait_s = 18
+    else:
+        wait_s = 30
+
+    if wait_s <= 0:
+        return
+
+    with st.status(f"{label} (attendo {wait_s}s per evitare 429)…", expanded=False) as s:
+        for sec in range(wait_s, 0, -1):
+            s.update(label=f"{label} (attendo {sec}s)…")
+            time.sleep(1)
+        s.update(label="Invio ora la richiesta…", state="complete")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
@@ -236,11 +263,15 @@ if run_btn:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary — **identico al locale** (stessi input)
+    # Executive Summary — **identico al locale** (stessi input items_ctx)
     st.info("Genero l’Executive Summary…")
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
-        # chiave cache basata su dimensione contesto + paesi + finestra (solo anti-rerun)
+
+        # Pacing adattivo (solo attesa; NON modifica l'input)
+        pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
+
+        # chiave cache solo anti-rerun; input invariato
         es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS}"
         es_text = call_once_per_run(es_cache_key, lambda: _retryable(
             summarizer.executive_summary, items_ctx, cfg, chosen_norm
