@@ -1,0 +1,13 @@
+# 1) rimuovi completamente file con segreti dalla storia (se esistono)
+git filter-repo --invert-paths --path .streamlit/secrets.toml --path .env
+
+# 2) sostituisci pattern di segreti nel contenuto storico (modifica replacements.txt)
+cat > replacements.txt <<'EOF'
+regex:\bsk-ant-[A-Za-z0-9_-]{20,}\b==>REDACTED
+regex:\b(?i)ANTHROPIC_API_KEY\s*=\s*["\'][^"\']+["\']\b==>ANTHROPIC_API_KEY="REDACTED"
+EOF
+git filter-repo --replace-text replacements.txt
+
+# 3) forza il push su tutti i branch e tag (ATTENZIONE: riscrive la storia)
+git push --force --all
+git push --force --tags

@@ -1,25 +1,30 @@
-# streamlit_app.py — UI Streamlit per te_macro_agent_final_multi.py (versione DB/Delta Mode)
-# - Nessuna modifica alla logica: usa funzioni/classi del file beta
-# - Pipeline identica al CLI: DB init → delta scrape → upsert → prune → load → fallback
-# - ES 60gg, selezione con build_selection(..., cfg)
-# - UI minimale: giorni + selezione Paesi, senza log debug né suggerimenti
+# streamlit_app.py — versione definitiva con bootstrap Playwright integrato
+# - Non modifica la logica del modulo beta: usa le funzioni/classi esistenti
+# - Aggiunge un bootstrap robusto per Playwright (libreria + browser Chromium)
+# - Mantiene la pipeline DB/Delta Mode, Executive Summary e report DOCX
 
 import os
 import sys
 import asyncio
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import List, Dict, Any
 
 import streamlit as st
 
-# Fix loop async Playwright su Windows
+# ──────────────────────────────────────────────────────────────────────────────
+# Compatibilità event loop Windows (no-op in Cloud)
+# ──────────────────────────────────────────────────────────────────────────────
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
 
-# Import esplicito del modulo beta (per usare tutte le funzioni così come sono)
+# ──────────────────────────────────────────────────────────────────────────────
+# Import del modulo beta (NON MODIFICATO)
+# ──────────────────────────────────────────────────────────────────────────────
 import te_macro_agent_final_multi as beta
 from te_macro_agent_final_multi import (
     Config,
@@ -28,11 +33,44 @@ from te_macro_agent_final_multi import (
     MacroSummarizer,
     build_selection,
     save_report,
-    # DB helpers
     db_init, db_upsert, db_count_by_country, db_load_recent, db_prune,
 )
 
-# ---------- UI ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Bootstrap Playwright (libreria + browser) — idempotente e cache-ato
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def ensure_playwright_chromium() -> None:
+    """
+    Garantisce che:
+      1) il modulo Python 'playwright' sia disponibile
+      2) i binari Chromium siano installati in ~/.cache/ms-playwright
+    È idempotente e veloce ai run successivi.
+    """
+    # Installa la libreria se assente
+    try:
+        import playwright  # noqa: F401
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])  # pin stabile
+
+    # Imposta la stessa path vista nei log di errore
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
+
+    base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+    chromium_present = base.exists() and any(p.name.startswith("chromium") for p in base.glob("chromium-*"))
+
+    if not chromium_present:
+        # Primo tentativo: con deps di sistema
+        try:
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
+        except subprocess.CalledProcessError:
+            # Fallback: senza --with-deps (su container che hanno già le deps APT)
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
 st.title("📈 StanAI Macro Agent")
 
@@ -47,7 +85,6 @@ with left:
 
 with right:
     st.markdown("**Seleziona i Paesi:**")
-    # Menu paesi coerente con il file beta
     countries_all = [
         "United States", "Euro Area", "Germany", "United Kingdom",
         "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
@@ -82,32 +119,37 @@ with right:
 
 st.divider()
 
-# ---------- Esecuzione ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Esecuzione
+# ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
-    # Log base (INFO), senza toggle debug
+    # Log base
     setup_logging()
-
-    # Config dal file beta
     cfg = Config()
 
-    # API Key: usiamo .env, non chiediamo input
+    # API Key: usiamo .env / secrets (il modulo beta la gestisce)
     if not cfg.ANTHROPIC_API_KEY:
-        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nel file .env. Aggiungila e riprova.")
+        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nel file .env o nei Secrets.")
         st.stop()
 
     if not chosen_countries:
         st.warning("Seleziona almeno un Paese prima di eseguire.")
         st.stop()
 
-    # Normalizza “European Union” → “Euro Area” (coerente con beta)
+    # Normalizza “European Union” → “Euro Area” per coerenza con il beta
     chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen_countries]
 
     st.write(
         f"▶ **Contesto ES:** {cfg.CONTEXT_DAYS} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_norm)}"
     )
 
-    # === Pipeline dati con DB (Delta Mode), identica al CLI ===
-    items_ctx = []
+    # Assicura playwright+chromium PRIMA di qualunque launch()
+    with st.status("Preparazione browser…", expanded=False) as st_status:
+        ensure_playwright_chromium()
+        st_status.update(label="Browser pronto", state="complete")
+
+    # Pipeline DB/Delta Mode (identica alla logica CLI del beta)
+    items_ctx: List[Dict[str, Any]] = []
 
     with st.status("Aggiornamento cache locale e caricamento notizie…", expanded=False) as st_status:
         try:
@@ -120,7 +162,7 @@ if run_btn:
                     (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
 
                 scraper = TEStreamScraper(cfg)
-                items_new = []
+                items_new: List[Dict[str, Any]] = []
 
                 # Fresh countries → scraping ampia finestra ES
                 if fresh:
@@ -144,7 +186,6 @@ if run_btn:
                         db_upsert(conn, all_new)
                         items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS)
             else:
-                # Se mai disattivassi il DB nel .env
                 scraper = TEStreamScraper(cfg)
                 items_ctx = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS)
 
@@ -157,7 +198,7 @@ if run_btn:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # === Executive Summary (60gg) ===
+    # Executive Summary
     st.info("Genero l’Executive Summary…")
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
@@ -169,18 +210,17 @@ if run_btn:
     st.subheader("Executive Summary")
     st.write(es_text)
 
-    # === Selezione ultimi N giorni (+ fill-up) ===
+    # Selezione ultimi N giorni (+ fill-up)
     st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, con fill-up se necessario)…")
     try:
         selection_items = build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
     except TypeError:
-        # Safety net nel caso tu cambiassi la firma in futuro
         selection_items = build_selection(items_ctx, int(days), cfg)
     except Exception as e:
         st.exception(e)
         st.stop()
 
-    # === Traduzione titoli + Riassunti IT ===
+    # Traduzione titoli + Riassunti IT
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
@@ -190,17 +230,15 @@ if run_btn:
             it["title_it"] = summarizer.translate_it(it.get("title", ""), cfg)
         except Exception:
             it["title_it"] = it.get("title", "") or ""
-
         try:
             it["summary_it"] = summarizer.summarize_item_it(it, cfg)
         except Exception:
             it["summary_it"] = (it.get("description", "") or "")
-
         prog.progress(i / total)
 
     st.success("✅ Pipeline completata.")
 
-    # === Anteprima Selezione ===
+    # Anteprima selezione
     with st.expander("Anteprima Selezione"):
         try:
             import pandas as pd
@@ -217,7 +255,7 @@ if run_btn:
         except Exception:
             st.info("Anteprima non disponibile (pandas mancante).")
 
-    # === Report DOCX ===
+    # Report DOCX
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
@@ -247,7 +285,7 @@ if run_btn:
     except Exception as e:
         st.error(f"Errore nella generazione/salvataggio DOCX: {e}")
 
-    # === Riepilogo ===
+    # Riepilogo
     st.write("---")
     st.write(f"**Notizie totali nel DB (ultimi {cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
     st.write(f"**Notizie selezionate (ultimi {int(days)} gg + fill-up):** {len(selection_items)}")
