@@ -1,45 +1,43 @@
-# streamlit_app.py — versione con import corretti + Secrets forzati + ES/riassunti in italiano
-# (NON modifica il macro agent; usa solo le sue API)
+# streamlit_app.py — robusto, solo lato Streamlit (non tocca il macro agent)
+# - Import robusti dal modulo
+# - ES e riassunti in ITALIANO
+# - Fallback selezione se build_selection_freshfirst non è esposta
+# - Gestione Playwright e salvataggio DOCX
 
-import os
-import sys
-import asyncio
-import subprocess
-import time
+import os, sys, time, subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_message
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Import dal macro agent (lasciare così: nomi esposti dal modulo)
+# Import base dal macro agent (senza funzioni "fragili")
 # ──────────────────────────────────────────────────────────────────────────────
-from te_macro_agent_final_multi import (
-    Config,
-    setup_logging,
-    TEStreamScraper,
-    MacroSummarizer,
-    # selezione
-    build_selection_freshfirst,
-    # DB helpers
-    db_init, db_upsert, db_load, db_prune,
-    # report
-    save_report,
-)
+import te_macro_agent_final_multi as ag  # import modulo intero per evitare ImportError
+
+# alias espliciti
+Config = ag.Config
+setup_logging = ag.setup_logging
+TEStreamScraper = ag.TEStreamScraper
+MacroSummarizer = ag.MacroSummarizer
+db_init = ag.db_init
+db_upsert = ag.db_upsert
+db_load = ag.db_load
+db_prune = ag.db_prune
+save_report = ag.save_report
+
+# proviamo a recuperare la selezione dal modulo; se non c'è, useremo un fallback locale
+_BUILD_SELECTION_FN = getattr(ag, "build_selection_freshfirst", None)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Secrets → env (per essere sicuri che Config legga i valori giusti)
+# Secrets → env (assicuriamo che Config legga i valori corretti)
 # ──────────────────────────────────────────────────────────────────────────────
 def _apply_secrets_to_env():
-    if "ANTHROPIC_API_KEY" in st.secrets:
-        os.environ["ANTHROPIC_API_KEY"] = str(st.secrets["ANTHROPIC_API_KEY"]).strip()
-    if "DB_PATH" in st.secrets:
-        os.environ["DB_PATH"] = str(st.secrets["DB_PATH"]).strip()
-    if "OUTPUT_DIR" in st.secrets:
-        os.environ["OUTPUT_DIR"] = str(st.secrets["OUTPUT_DIR"]).strip()
-
+    for key in ("ANTHROPIC_API_KEY", "DB_PATH", "OUTPUT_DIR"):
+        if key in st.secrets:
+            os.environ[key] = str(st.secrets[key]).strip()
 _apply_secrets_to_env()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -61,12 +59,12 @@ def ensure_playwright_chromium() -> None:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Retry/backoff e pacing
+# Retry/backoff & pacing
 # ──────────────────────────────────────────────────────────────────────────────
 def _retryable(fn, *args, **kwargs):
     @retry(
         reraise=True,
-        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit|Too Many Requests)"),
+        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|Too Many Requests)"),
         wait=wait_exponential(multiplier=1.5, min=2, max=30),
         stop=stop_after_attempt(5),
     )
@@ -86,8 +84,8 @@ def call_once_per_run(cache_key: str, caller):
 def _rough_token_estimate(items):
     total_chars = 0
     for it in items:
-        total_chars += len(it.get("title", "") or "")
-        total_chars += len(it.get("description", "") or "")
+        total_chars += len((it.get("title") or ""))
+        total_chars += len((it.get("description") or ""))
     return max(1, total_chars // 4)
 
 def pace_before_big_request(items, label="Preparazione Executive Summary…"):
@@ -104,28 +102,74 @@ def pace_before_big_request(items, label="Preparazione Executive Summary…"):
         s.update(label="Invio ora la richiesta…", state="complete")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Fallback locale per la selezione (se la funzione del modulo non è esposta)
+# Ordine: colore (3→0), score desc, recency asc, dedup titoli per paese.
+# ──────────────────────────────────────────────────────────────────────────────
+def _simple_selection_fallback(items_stream: List[Dict[str,Any]],
+                               items_cache: List[Dict[str,Any]],
+                               days_N: int, max_news: int) -> List[Dict[str,Any]]:
+    import math
+    def hours(d: Optional[float]) -> float:
+        return (d or 0.0) * 24.0
+    horizon_h = int(round(days_N)) * 24
+    combined, seen = [], set()
+    for it in (items_stream + items_cache):
+        if it.get("age_days") is None: continue
+        if hours(it["age_days"]) > horizon_h: continue
+        fp = (it.get("country",""), (it.get("title") or "").strip().lower())
+        if fp in seen: continue
+        seen.add(fp)
+        combined.append(it)
+    if not combined: return []
+
+    def key_sort(i):
+        color = int(i.get("importance",0))
+        score = int(i.get("score",0))
+        age = float(i.get("age_days", 9999))
+        # colore desc, score desc, recency asc
+        return (-color, -score, age)
+
+    combined.sort(key=key_sort)
+    out = []
+    dedup = set()
+    for it in combined:
+        if len(out) >= max_news: break
+        k = (it.get("country",""), (it.get("title") or "").strip().lower())
+        if k in dedup: continue
+        dedup.add(k)
+        out.append(it)
+    return out
+
+def build_selection(items_stream: List[Dict[str,Any]],
+                    items_cache: List[Dict[str,Any]],
+                    days_N: int, max_news: int) -> List[Dict[str,Any]]:
+    if callable(_BUILD_SELECTION_FN):
+        return _BUILD_SELECTION_FN(items_stream, items_cache, days_N, max_news)
+    return _simple_selection_fallback(items_stream, items_cache, days_N, max_news)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
-st.title("📈 StanAI Macro Agent — Secrets Mode")
+st.title("📈 StanAI Macro Agent — Solo Streamlit")
 
-# Diagnostica chiave mascherata
-key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-masked = f"{key[:6]}…{key[-4:]} (len={len(key)})" if key else "—"
+# Diagnostica chiave
+api_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+masked = f"{api_key[:6]}…{api_key[-4:]} (len={len(api_key)})" if api_key else "—"
 st.caption(f"ANTHROPIC_API_KEY caricata: {masked}")
-if not key or not key.startswith("sk-ant-"):
+if not api_key or not api_key.startswith("sk-ant-"):
     st.error("Chiave Anthropic mancante o nel formato sbagliato (attesa: 'sk-ant-…'). Correggi i Secrets e premi Rerun.")
     st.stop()
 
 left, right = st.columns([1, 2], gap="large")
 with left:
-    days = st.number_input("Giorni da mostrare nella SELEZIONE", min_value=1, max_value=30, value=5, step=1)
+    days = st.number_input("Giorni per la SELEZIONE", min_value=1, max_value=30, value=5, step=1)
     run_btn = st.button("Esegui pipeline")
 with right:
     st.markdown("**Seleziona i Paesi:**")
     countries_all = [
-        "United States", "Euro Area", "Germany", "United Kingdom",
-        "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
+        "United States","Euro Area","Germany","United Kingdom",
+        "Italy","France","China","Japan","Spain","Netherlands","European Union"
     ]
     c1, c2 = st.columns(2)
     with c1: select_all = st.button("Seleziona tutti")
@@ -151,7 +195,7 @@ st.divider()
 # ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
     setup_logging()
-    cfg = Config()  # leggerà env (popolati dai Secrets)
+    cfg = Config()  # legge da env (già popolati)
 
     if not chosen_countries:
         st.warning("Seleziona almeno un Paese prima di eseguire.")
@@ -194,56 +238,47 @@ if run_btn:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary
+    # Executive Summary (IT, con fallback)
     st.info("Genero l’Executive Summary…")
     es_error = None
     es_text = ""
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
         pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
-        es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
-        es_text = call_once_per_run(es_cache_key, lambda: _retryable(
+        cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
+        es_raw = call_once_per_run(cache_key, lambda: _retryable(
             summarizer.executive_summary, items_ctx, cfg
+        ))
+        # traduzione in italiano
+        es_text = call_once_per_run(f"es_it::{hash(es_raw)}", lambda: _retryable(
+            summarizer.translate_it, es_raw
         ))
     except Exception as e:
         es_error = str(e)
         es_text = "Executive Summary non disponibile per errore di generazione."
-
     st.subheader("Executive Summary")
     if es_error:
         st.error(f"Motivo errore ES: {es_error}")
-
-    # Traduci ES in italiano se necessario
-    try:
-        if es_text and es_text.strip() and "non disponibile" not in es_text.lower():
-            es_text_it = call_once_per_run(f"es_it::{hash(es_text)}", lambda: _retryable(
-                summarizer.translate_it, es_text
-            ))
-            if es_text_it and len(es_text_it) >= 20:
-                es_text = es_text_it
-    except Exception as e:
-        st.warning(f"Traduzione ES non riuscita (uso testo originale): {e}")
-
     st.write(es_text)
 
-    # Selezione fresh-first
-    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, colore-first)…")
+    # Selezione
+    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni)…")
     try:
-        selection_items = build_selection_freshfirst(
+        selection_items = build_selection(
             items_stream=items_stream_30d,
             items_cache=items_cache_60d,
             days_N=int(days),
             max_news=cfg.MAX_NEWS
         )
     except Exception as e:
-        st.exception(e)
-        st.stop()
+        # fallback duro se anche la nostra wrapper fallisce
+        selection_items = _simple_selection_fallback(items_stream_30d, items_cache_60d, int(days), cfg.MAX_NEWS)
+        st.warning(f"Selezione: uso fallback locale per un errore: {e}")
 
-    # Traduzioni/riassunti italiani con fallback
+    # Ri-traduzioni/riassunti in IT con fallback
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
-
     for i, it in enumerate(selection_items, 1):
         # Titolo IT
         try:
@@ -252,8 +287,7 @@ if run_btn:
             ))
         except Exception:
             it["title_it"] = it.get("title","") or ""
-
-        # Riassunto IT primario
+        # Riassunto IT con fallback
         try:
             it["summary_it"] = call_once_per_run(
                 f"si::{hash((it.get('title',''), it.get('time','')))}",
@@ -307,6 +341,7 @@ if run_btn:
             os.environ.get("OUTPUT_DIR", "reports"),
         )
         st.info(f"Report salvato su disco: `{out_path}`")
+        # download
         try:
             data = Path(out_path).read_bytes()
             st.download_button(
