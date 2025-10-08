@@ -1,7 +1,9 @@
-# streamlit_app.py — compat con te_macro_agent_final_multi.py (NO changes to macro agent)
-# - Non tocca la logica del modulo beta
-# - Allinea gli import e le chiamate alle funzioni effettivamente esposte dal modulo
-# - Mantiene bootstrap Playwright, retry/backoff e pacing "gentile"
+# streamlit_app.py — Revisione totale (solo Streamlit) compatibile con te_macro_agent_final_multi.py
+# - Non tocca il macro agent: usa esclusivamente le API esposte dal modulo
+# - Executive Summary forzato in IT (se disponibile), diagnostica errori chiara
+# - Riassunti delle notizie in IT con fallback a traduzione automatica della description
+# - Bootstrap Playwright idempotente, retry/backoff 429, pacing adattivo
+# - UI semplice, report DOCX scaricabile
 
 import os
 import sys
@@ -27,7 +29,6 @@ if sys.platform.startswith("win"):
 # ──────────────────────────────────────────────────────────────────────────────
 # Import del modulo macro agent (NON MODIFICATO)
 # ──────────────────────────────────────────────────────────────────────────────
-import te_macro_agent_final_multi as beta
 from te_macro_agent_final_multi import (
     Config,
     setup_logging,
@@ -81,7 +82,7 @@ def _retryable(fn, *args, **kwargs):
     """
     @retry(
         reraise=True,
-        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit)"),
+        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit|Too Many Requests)"),
         wait=wait_exponential(multiplier=1.5, min=2, max=30),
         stop=stop_after_attempt(5),
     )
@@ -138,7 +139,7 @@ def pace_before_big_request(items, label="Preparazione Executive Summary…"):
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
-st.title("📈 StanAI Macro Agent")
+st.title("📈 StanAI Macro Agent — Dashboard")
 
 left, right = st.columns([1, 2], gap="large")
 
@@ -151,7 +152,6 @@ with left:
 
 with right:
     st.markdown("**Seleziona i Paesi:**")
-    # Menu paesi coerente con il beta
     countries_all = [
         "United States", "Euro Area", "Germany", "United Kingdom",
         "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
@@ -190,37 +190,37 @@ st.divider()
 # Esecuzione
 # ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
-    # Log base
     setup_logging()
     cfg = Config()
 
-    # API Key: usiamo .env / secrets (il modulo beta la gestisce)
+    # API Key
     if not cfg.ANTHROPIC_API_KEY:
-        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nel file .env o nei Secrets.")
+        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nei Secrets o nel .env.")
         st.stop()
 
     if not chosen_countries:
         st.warning("Seleziona almeno un Paese prima di eseguire.")
         st.stop()
 
-    # Normalizza “European Union” → “Euro Area” per coerenza con il beta
+    # Normalizza “European Union” → “Euro Area”
     chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen_countries]
 
     st.write(
         f"▶ **ES (contesto)**: {cfg.CONTEXT_DAYS_ES} giorni | **Selezione**: {days} giorni | **Paesi**: {', '.join(chosen_norm)}"
     )
 
-    # Assicura playwright+chromium PRIMA di qualunque launch()
+    # Playwright/Chromium
     with st.status("Preparazione browser…", expanded=False) as st_status:
         ensure_playwright_chromium()
         st_status.update(label="Browser pronto", state="complete")
 
-    # Scrape per aggiornare DB (fino a 30 gg per ES)
+    # Scrape + DB
     with st.status("Aggiornamento cache locale e caricamento notizie…", expanded=False) as st_status:
         try:
             scraper = TEStreamScraper(cfg)
+            horizon = max(cfg.CONTEXT_DAYS_ES, int(days))
             items_stream_30d: List[Dict[str, Any]] = scraper.scrape_stream(
-                chosen_norm, horizon_days=max(cfg.CONTEXT_DAYS_ES, int(days))
+                chosen_norm, horizon_days=horizon
             )
 
             if cfg.USE_DB:
@@ -240,34 +240,46 @@ if run_btn:
             st.exception(e)
             st.stop()
 
-    # Scegli contesto per ES come nel CLI del beta
+    # Contesto ES
     items_ctx = items_cache_60d if items_cache_60d else items_stream_30d
     if not items_ctx:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary — **identico alla CLI** (stessi input items_ctx)
+    # Executive Summary con diagnostica + traduzione IT
     st.info("Genero l’Executive Summary…")
+    es_error = None
+    es_text = ""
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
-
-        # Pacing adattivo (solo attesa; NON modifica l'input)
         pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
-
-        # chiave cache solo anti-rerun; input invariato
         es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
         es_text = call_once_per_run(es_cache_key, lambda: _retryable(
             summarizer.executive_summary, items_ctx, cfg
         ))
     except Exception as e:
-        st.exception(e)
+        es_error = str(e)
         es_text = "Executive Summary non disponibile per errore di generazione."
 
     st.subheader("Executive Summary")
+    if es_error:
+        st.error(f"Motivo errore ES: {es_error}")
+
+    # Prova a tradurre in IT se l'ES è presente ma potrebbe essere in inglese
+    try:
+        if es_text and es_text.strip() and "non disponibile" not in es_text.lower():
+            es_text_it = call_once_per_run(f"es_it::{hash(es_text)}", lambda: _retryable(
+                summarizer.translate_it, es_text
+            ))
+            if es_text_it and len(es_text_it) >= 20:
+                es_text = es_text_it
+    except Exception as e:
+        st.warning(f"Traduzione ES non riuscita (uso testo originale): {e}")
+
     st.write(es_text)
 
-    # Selezione Fresh-first (N×24h) — come da beta
-    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, colore-first hard)…")
+    # Selezione Fresh-first (N×24h)
+    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, colore-first)…")
     try:
         selection_items = build_selection_freshfirst(
             items_stream=items_stream_30d,
@@ -279,13 +291,13 @@ if run_btn:
         st.exception(e)
         st.stop()
 
-    # Traduzione titoli + Riassunti IT — input identico, solo retry e piccola pausa
+    # Traduzione titoli + Riassunti IT con fallback a traduzione description
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
 
     for i, it in enumerate(selection_items, 1):
-        # Traduzione titolo (retry 429)
+        # Titolo IT
         try:
             it["title_it"] = call_once_per_run(f"ti::{hash(it.get('title',''))}", lambda: _retryable(
                 summarizer.translate_it, it.get("title","")
@@ -293,16 +305,26 @@ if run_btn:
         except Exception:
             it["title_it"] = it.get("title","") or ""
 
-        # Riassunto IT (retry 429) — metodo: summarize_it
+        # Riassunto IT primario
         try:
-            it["summary_it"] = call_once_per_run(f"si::{hash((it.get('title',''), it.get('time','')))}", lambda: _retryable(
-                summarizer.summarize_it, it
-            ))
+            it["summary_it"] = call_once_per_run(
+                f"si::{hash((it.get('title',''), it.get('time','')))}",
+                lambda: _retryable(summarizer.summarize_it, it)
+            )
+            # Se troppo corto, forza fallback
+            if not it["summary_it"] or len(it["summary_it"]) < 40:
+                raise RuntimeError("Riassunto troppo corto, uso fallback traduzione description")
         except Exception:
-            it["summary_it"] = (it.get("description","") or "")
+            desc = it.get("description", "") or it.get("title", "")
+            try:
+                it["summary_it"] = call_once_per_run(
+                    f"si_fallback::{hash(desc)}",
+                    lambda: _retryable(summarizer.translate_it, desc)
+                )
+            except Exception:
+                it["summary_it"] = (it.get("title_it") or it.get("title") or "Sintesi non disponibile.")
 
-        # Pausa “gentile” per smussare picchi (non cambia il contenuto)
-        time.sleep(0.2)
+        time.sleep(0.15)
         prog.progress(i / total)
 
     st.success("✅ Pipeline completata.")
@@ -319,6 +341,7 @@ if run_btn:
                 "score": it.get("score",0),
                 "category": it.get("category_mapped",""),
                 "title_it": (it.get("title_it","") or "")[:120],
+                "summary_it": (it.get("summary_it","") or "")[:160],
             } for it in selection_items]
             st.dataframe(pd.DataFrame(prev_sel), use_container_width=True)
         except Exception:
@@ -328,7 +351,6 @@ if run_btn:
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
-        # save_report signature: (filename, es_text, sel, countries, days_N, out_dir)
         out_path = save_report(
             filename,
             es_text,
