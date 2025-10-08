@@ -1,4 +1,4 @@
-# streamlit_app.py — versione che usa esplicitamente Streamlit Secrets per API key e path
+# streamlit_app.py — versione che usa esplicitamente Streamlit Secrets per API key 
 # (contenuto identico al precedente tentativo; ripubblicato)
 
 import os
