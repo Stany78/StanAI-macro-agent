@@ -304,6 +304,15 @@ if run_btn:
     setup_logging()
     cfg = Config()
 
+    # Adapters DB: se mancano i wrapper ma esiste beta.db_load, definiscili ora
+    if (db_count_by_country is None) and hasattr(beta, "db_load"):
+        def db_count_by_country(conn, country: str) -> int:
+            return len(beta.db_load(conn, [country], max_age_days=getattr(cfg, "CONTEXT_DAYS_ES", 30)))
+    if (db_load_recent is None) and hasattr(beta, "db_load"):
+        def db_load_recent(conn, countries, max_age_days: int):
+            return beta.db_load(conn, countries, max_age_days=max_age_days)
+
+
     # API Key: usiamo .env / secrets (il modulo beta la gestisce)
     if not cfg.ANTHROPIC_API_KEY:
         st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nel file .env o nei Secrets.")
