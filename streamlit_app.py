@@ -271,7 +271,7 @@ if run_btn:
                     (warm if cnt >= WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
                 items_new: List[Dict[str,Any]] = []
                 if fresh:
-                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS_ES)
+                    items_new += scraper.scrape_stream(fresh, horizon_days=cfg.CONTEXT_DAYS_ES)
                 if warm:
                     items_new += scraper.scrape_30d(warm, max_days=min(SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS_ES))
                 if items_new:
@@ -279,12 +279,12 @@ if run_btn:
                     db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
                 items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS_ES)
                 if len(items_ctx) < 20:
-                    all_new = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS_ES)
+                    all_new = scraper.scrape_stream(chosen_norm, horizon_days=cfg.CONTEXT_DAYS_ES)
                     if all_new:
                         db_upsert(conn, all_new)
                         items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS_ES)
             else:
-                items_ctx = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS_ES)
+                items_ctx = scraper.scrape_stream(chosen_norm, horizon_days=cfg.CONTEXT_DAYS_ES)
             s.update(label=f"Notizie disponibili (finestra {cfg.CONTEXT_DAYS_ES}gg): {len(items_ctx)}", state="complete")
         except Exception as e:
             msg = str(e)
