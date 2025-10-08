@@ -28,17 +28,112 @@ if sys.platform.startswith("win"):
 # ──────────────────────────────────────────────────────────────────────────────
 # Import del modulo beta (NON MODIFICATO)
 # ──────────────────────────────────────────────────────────────────────────────
-import te_macro_agent_final_multi as beta
-from te_macro_agent_final_multi import (
-    Config,
-    setup_logging,
-    TEStreamScraper,
-    MacroSummarizer,
-    build_selection,
-    save_report,
-    # DB helpers
-    db_init, db_upsert, db_count_by_country, db_load_recent, db_prune,
-)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Import del modulo beta (robusto, con diagnostica e fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+import importlib
+from types import ModuleType
+from pathlib import Path as _P
+
+_THIS_DIR = _P(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+def _import_beta() -> ModuleType:
+    try:
+        return importlib.import_module("te_macro_agent_final_multi")
+    except Exception as e:
+        st.error(f"""
+### ❌ Errore durante l'import del modulo `te_macro_agent_final_multi.py`
+
+Assicurati che:
+- il file sia nella stessa cartella dell'app Streamlit
+- tutte le dipendenze del modulo siano installate
+
+**Dettagli:** {type(e).__name__}: {e}
+""")
+        st.stop()
+
+beta = _import_beta()
+
+# Essenziali
+for _name in ["Config","setup_logging","TEStreamScraper","MacroSummarizer","save_report","db_init","db_upsert","db_prune"]:
+    if not hasattr(beta, _name):
+        st.error(f"Nel modulo mancano simboli essenziali: {_name}")
+        st.stop()
+
+Config = getattr(beta, "Config")
+setup_logging = getattr(beta, "setup_logging")
+TEStreamScraper = getattr(beta, "TEStreamScraper")
+MacroSummarizer = getattr(beta, "MacroSummarizer")
+save_report = getattr(beta, "save_report")
+db_init = getattr(beta, "db_init")
+db_upsert = getattr(beta, "db_upsert")
+db_prune = getattr(beta, "db_prune")
+
+# Opzionali con fallback
+_has_build_selection = hasattr(beta, "build_selection")
+_has_db_count = hasattr(beta, "db_count_by_country")
+_has_db_load = hasattr(beta, "db_load_recent")
+
+if _has_build_selection:
+    build_selection = getattr(beta, "build_selection")
+else:
+    st.warning("Fallback attivo: `build_selection` non trovato — uso una selezione base ultimi N giorni.")
+    from datetime import datetime, timezone
+
+    def _parse_time(ts):
+        if isinstance(ts, (int, float)):
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            except Exception:
+                return None
+        if not ts:
+            return None
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%S.%f%z","%Y-%m-%d %H:%M:%S%z",
+                    "%Y-%m-%dT%H:%M:%S","%Y-%m-%d %H:%M:%S","%Y-%m-%d"):
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.strptime(ts, fmt)
+                if "%z" not in fmt:
+                    from datetime import timezone as _tz
+                    dt = dt.replace(tzinfo=_tz.utc)
+                return dt
+            except Exception:
+                continue
+        return None
+
+    def build_selection(items_ctx, days, cfg, expand1_days=10, expand2_days=30):
+        now = datetime.now(timezone.utc)
+        out = []
+        for it in items_ctx:
+            age = it.get("age_days")
+            if isinstance(age, (int, float)):
+                if age <= days: out.append(it); continue
+            ts = _parse_time(it.get("time"))
+            if ts is None or (now - ts).days <= days:
+                out.append(it)
+        def _key(it):
+            ts = _parse_time(it.get("time"))
+            return ts or now
+        out.sort(key=_key, reverse=True)
+        return out
+
+if _has_db_count:
+    db_count_by_country = getattr(beta, "db_count_by_country")
+else:
+    st.info("Fallback: `db_count_by_country` non presente — considero i paesi sempre 'fresh'.")
+    def db_count_by_country(conn, country: str) -> int:
+        return 0
+
+if _has_db_load:
+    db_load_recent = getattr(beta, "db_load_recent")
+else:
+    st.info("Fallback: `db_load_recent` non presente — userò solo i risultati appena scaricati.")
+    def db_load_recent(conn, countries, max_age_days: int):
+        return []
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Bootstrap Playwright (libreria + browser) — idempotente e cache-ato
