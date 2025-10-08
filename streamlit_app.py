@@ -234,6 +234,9 @@ st.divider()
 if run_btn:
     setup_logging()
     cfg = Config()
+    # Default per compatibilità con versioni diverse del modulo
+    WARMUP_NEW_COUNTRY_MIN = getattr(cfg, 'WARMUP_NEW_COUNTRY_MIN', 20)
+    SCRAPE_HORIZON_DAYS = getattr(cfg, 'SCRAPE_HORIZON_DAYS', min(int(getattr(cfg, 'CONTEXT_DAYS_ES', 30)), 7))
 
     if not getattr(cfg, "ANTHROPIC_API_KEY", None):
         st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nel file .env o nei Secrets.")
@@ -244,7 +247,7 @@ if run_btn:
         st.stop()
 
     chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen]
-    st.write(f"▶ **Contesto ES:** {cfg.CONTEXT_DAYS} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_norm)}")
+    st.write(f"▶ **Contesto ES:** {cfg.CONTEXT_DAYS_ES} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_norm)}")
 
     # Preflight Playwright
     with st.status("Preparazione browser…", expanded=False):
@@ -265,24 +268,24 @@ if run_btn:
                 warm, fresh = [], []
                 for c in chosen_norm:
                     cnt = db_count_by_country(conn, c)
-                    (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
+                    (warm if cnt >= WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
                 items_new: List[Dict[str,Any]] = []
                 if fresh:
-                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
+                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS_ES)
                 if warm:
-                    items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
+                    items_new += scraper.scrape_30d(warm, max_days=min(SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS_ES))
                 if items_new:
                     db_upsert(conn, items_new)
                     db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
-                items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS)
+                items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS_ES)
                 if len(items_ctx) < 20:
-                    all_new = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS)
+                    all_new = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS_ES)
                     if all_new:
                         db_upsert(conn, all_new)
-                        items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS)
+                        items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS_ES)
             else:
-                items_ctx = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS)
-            s.update(label=f"Notizie disponibili (finestra {cfg.CONTEXT_DAYS}gg): {len(items_ctx)}", state="complete")
+                items_ctx = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS_ES)
+            s.update(label=f"Notizie disponibili (finestra {cfg.CONTEXT_DAYS_ES}gg): {len(items_ctx)}", state="complete")
         except Exception as e:
             msg = str(e)
             if "Host system is missing dependencies to run browsers" in msg:
@@ -316,7 +319,7 @@ sudo playwright install-deps
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
         pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
-        cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS}"
+        cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
         with suppress_rate_limit_logs():
             es_text = call_once_per_run(cache_key, lambda: _retryable(
                 summarizer.executive_summary, items_ctx, cfg, chosen_norm
@@ -410,6 +413,6 @@ sudo playwright install-deps
         st.error(f"Errore nella generazione/salvataggio DOCX: {e}")
 
     st.write("---")
-    st.write(f"**Notizie totali nel DB (ultimi {cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
+    st.write(f"**Notizie totali nel DB (ultimi {cfg.CONTEXT_DAYS_ES} gg):** {len(items_ctx)}")
     st.write(f"**Notizie selezionate (ultimi {int(days)} gg):** {len(selection_items)}")
     st.caption(f"Esecuzione: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
