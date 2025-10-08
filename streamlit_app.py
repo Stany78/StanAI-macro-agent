@@ -1,70 +1,74 @@
-# streamlit_app.py — robusto, solo lato Streamlit (non tocca il macro agent)
-# - Import robusti dal modulo
-# - ES e riassunti in ITALIANO
-# - Fallback selezione se build_selection_freshfirst non è esposta
-# - Gestione Playwright e salvataggio DOCX
+# streamlit_app.py — allineato a te_macro_agent_final_multi.py
+# - Usa SOLO API esposte nel macro agent che mi hai inviato
+# - Executive Summary: usa signature (context_items, cfg, chosen_countries)
+# - Selezione: build_selection(items_ctx, days, cfg)
+# - Riassunti in IT con summarize_item_it; titoli in IT con translate_it
+# - DB: db_count_by_country, db_load_recent, db_upsert, db_prune
+# - Scraper: scrape_30d
+# - Report: save_report(filename, es_text, selection, countries, days, context_count, output_dir)
+# - Legge ANTHROPIC_API_KEY/DB_PATH/OUTPUT_DIR dai Secrets → env PRIMA di istanziare Config()
 
-import os, sys, time, subprocess
+import os
+import time
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import streamlit as st
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_message
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Import base dal macro agent (senza funzioni "fragili")
+# Import dal macro agent (come definito nel file che mi hai dato)
 # ──────────────────────────────────────────────────────────────────────────────
-import te_macro_agent_final_multi as ag  # import modulo intero per evitare ImportError
+import te_macro_agent_final_multi as ag
 
-# alias espliciti
 Config = ag.Config
 setup_logging = ag.setup_logging
 TEStreamScraper = ag.TEStreamScraper
 MacroSummarizer = ag.MacroSummarizer
+build_selection = ag.build_selection
 db_init = ag.db_init
 db_upsert = ag.db_upsert
-db_load = ag.db_load
 db_prune = ag.db_prune
+db_count_by_country = ag.db_count_by_country
+db_load_recent = ag.db_load_recent
 save_report = ag.save_report
 
-# proviamo a recuperare la selezione dal modulo; se non c'è, useremo un fallback locale
-_BUILD_SELECTION_FN = getattr(ag, "build_selection_freshfirst", None)
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Secrets → env (assicuriamo che Config legga i valori corretti)
+# Secrets → env (per far sì che Config() trovi la chiave e i path giusti)
 # ──────────────────────────────────────────────────────────────────────────────
 def _apply_secrets_to_env():
-    for key in ("ANTHROPIC_API_KEY", "DB_PATH", "OUTPUT_DIR"):
-        if key in st.secrets:
-            os.environ[key] = str(st.secrets[key]).strip()
+    for k in ("ANTHROPIC_API_KEY", "DB_PATH", "OUTPUT_DIR"):
+        if k in st.secrets:
+            os.environ[k] = str(st.secrets[k]).strip()
 _apply_secrets_to_env()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Playwright bootstrap (idempotente)
+# Playwright bootstrap (il macro usa playwright sync API)
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_chromium() -> None:
     try:
         import playwright  # noqa: F401
     except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
+        subprocess.check_call([os.sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
     base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
     chromium_present = base.exists() and any(p.name.startswith("chromium") for p in base.glob("chromium-*"))
     if not chromium_present:
         try:
-            subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
+            subprocess.check_call([os.sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
         except subprocess.CalledProcessError:
-            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+            subprocess.check_call([os.sys.executable, "-m", "playwright", "install", "chromium"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Retry/backoff & pacing
+# Retry helper per le chiamate al modello (409/429 tipici)
 # ──────────────────────────────────────────────────────────────────────────────
 def _retryable(fn, *args, **kwargs):
     @retry(
         reraise=True,
-        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|Too Many Requests)"),
+        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|Too Many Requests|acceleration limit)"),
         wait=wait_exponential(multiplier=1.5, min=2, max=30),
         stop=stop_after_attempt(5),
     )
@@ -81,96 +85,28 @@ def call_once_per_run(cache_key: str, caller):
     st.session_state.api_once_cache[cache_key] = val
     return val
 
-def _rough_token_estimate(items):
-    total_chars = 0
-    for it in items:
-        total_chars += len((it.get("title") or ""))
-        total_chars += len((it.get("description") or ""))
-    return max(1, total_chars // 4)
-
-def pace_before_big_request(items, label="Preparazione Executive Summary…"):
-    est_tokens = _rough_token_estimate(items)
-    if   est_tokens < 30000: wait_s = 0
-    elif est_tokens < 60000: wait_s = 8
-    elif est_tokens < 90000: wait_s = 18
-    else:                    wait_s = 30
-    if wait_s <= 0: return
-    with st.status(f"{label} (attendo {wait_s}s per evitare 429)…", expanded=False) as s:
-        for sec in range(wait_s, 0, -1):
-            s.update(label=f"{label} (attendo {sec}s)…")
-            time.sleep(1)
-        s.update(label="Invio ora la richiesta…", state="complete")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Fallback locale per la selezione (se la funzione del modulo non è esposta)
-# Ordine: colore (3→0), score desc, recency asc, dedup titoli per paese.
-# ──────────────────────────────────────────────────────────────────────────────
-def _simple_selection_fallback(items_stream: List[Dict[str,Any]],
-                               items_cache: List[Dict[str,Any]],
-                               days_N: int, max_news: int) -> List[Dict[str,Any]]:
-    import math
-    def hours(d: Optional[float]) -> float:
-        return (d or 0.0) * 24.0
-    horizon_h = int(round(days_N)) * 24
-    combined, seen = [], set()
-    for it in (items_stream + items_cache):
-        if it.get("age_days") is None: continue
-        if hours(it["age_days"]) > horizon_h: continue
-        fp = (it.get("country",""), (it.get("title") or "").strip().lower())
-        if fp in seen: continue
-        seen.add(fp)
-        combined.append(it)
-    if not combined: return []
-
-    def key_sort(i):
-        color = int(i.get("importance",0))
-        score = int(i.get("score",0))
-        age = float(i.get("age_days", 9999))
-        # colore desc, score desc, recency asc
-        return (-color, -score, age)
-
-    combined.sort(key=key_sort)
-    out = []
-    dedup = set()
-    for it in combined:
-        if len(out) >= max_news: break
-        k = (it.get("country",""), (it.get("title") or "").strip().lower())
-        if k in dedup: continue
-        dedup.add(k)
-        out.append(it)
-    return out
-
-def build_selection(items_stream: List[Dict[str,Any]],
-                    items_cache: List[Dict[str,Any]],
-                    days_N: int, max_news: int) -> List[Dict[str,Any]]:
-    if callable(_BUILD_SELECTION_FN):
-        return _BUILD_SELECTION_FN(items_stream, items_cache, days_N, max_news)
-    return _simple_selection_fallback(items_stream, items_cache, days_N, max_news)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
-st.title("📈 StanAI Macro Agent — Solo Streamlit")
+st.title("📈 StanAI Macro Agent — UI Streamlit (compatibile)")
 
-# Diagnostica chiave
-api_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-masked = f"{api_key[:6]}…{api_key[-4:]} (len={len(api_key)})" if api_key else "—"
+# Diagnostica chiave (mascherata) per capire se l'app sta usando i Secrets giusti
+_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+masked = f"{_key[:6]}…{_key[-4:]} (len={len(_key)})" if _key else "—"
 st.caption(f"ANTHROPIC_API_KEY caricata: {masked}")
-if not api_key or not api_key.startswith("sk-ant-"):
-    st.error("Chiave Anthropic mancante o nel formato sbagliato (attesa: 'sk-ant-…'). Correggi i Secrets e premi Rerun.")
+if not _key or not _key.startswith("sk-ant-"):
+    st.error("Chiave Anthropic mancante/non valida (attesa: 'sk-ant-…'). Correggi i Secrets e poi Rerun.")
     st.stop()
 
 left, right = st.columns([1, 2], gap="large")
 with left:
-    days = st.number_input("Giorni per la SELEZIONE", min_value=1, max_value=30, value=5, step=1)
     run_btn = st.button("Esegui pipeline")
+    days = st.number_input("Giorni per la SELEZIONE (1–30)", min_value=1, max_value=30, value=5, step=1)
 with right:
-    st.markdown("**Seleziona i Paesi:**")
-    countries_all = [
-        "United States","Euro Area","Germany","United Kingdom",
-        "Italy","France","China","Japan","Spain","Netherlands","European Union"
-    ]
+    cfg_tmp = Config()  # solo per leggere il menu paesi di default dal modulo
+    st.markdown("**Seleziona i Paesi (coerenti col macro agent):**")
+    countries_all = cfg_tmp.DEFAULT_COUNTRIES_MENU
     c1, c2 = st.columns(2)
     with c1: select_all = st.button("Seleziona tutti")
     with c2: deselect_all = st.button("Deseleziona tutti")
@@ -195,122 +131,121 @@ st.divider()
 # ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
     setup_logging()
-    cfg = Config()  # legge da env (già popolati)
+    cfg = Config()  # ora che env è popolato dai Secrets, qui trovi anche OUTPUT_DIR/DB_PATH/chiave ecc.
 
     if not chosen_countries:
-        st.warning("Seleziona almeno un Paese prima di eseguire.")
+        st.warning("Seleziona almeno un Paese.")
         st.stop()
 
-    chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen_countries]
-    st.write(f"▶ **ES (contesto)**: {cfg.CONTEXT_DAYS_ES} giorni | **Selezione**: {days} giorni | **Paesi**: {', '.join(chosen_norm)}")
+    st.write(f"▶ **Contesto ES (giorni)**: {cfg.CONTEXT_DAYS} | **Selezione**: {days} giorni")
+    st.write(f"▶ **Paesi**: {', '.join(chosen_countries)}")
 
-    # Browser
-    with st.status("Preparazione browser…", expanded=False) as st_status:
+    # Browser pronto (il macro aprirà Playwright in scraper.scrape_30d)
+    with st.status("Preparazione browser…", expanded=False) as sst:
         ensure_playwright_chromium()
-        st_status.update(label="Browser pronto", state="complete")
+        sst.update(label="Browser pronto", state="complete")
 
-    # Scrape + DB
-    with st.status("Aggiornamento cache locale e caricamento notizie…", expanded=False) as st_status:
+    # ==== Pipeline dati con DB (Delta Mode) — fedele al macro agent ====
+    items_ctx: List[Dict[str, Any]] = []
+    with st.status("Carico/aggiorno notizie (DB + stream)…", expanded=False) as sst:
         try:
             scraper = TEStreamScraper(cfg)
-            horizon = max(cfg.CONTEXT_DAYS_ES, int(days))
-            items_stream_30d: List[Dict[str, Any]] = scraper.scrape_stream(chosen_norm, horizon_days=horizon)
+            conn = db_init(cfg.DB_PATH)
 
-            if cfg.USE_DB:
-                conn = db_init(cfg.DB_PATH)
-                if items_stream_30d:
-                    db_upsert(conn, items_stream_30d)
-                    db_prune(conn, cfg.PRUNE_DAYS)
-                items_cache_60d = db_load(conn, chosen_norm, max_age_days=cfg.PRUNE_DAYS)
-            else:
-                items_cache_60d = []
+            warm, fresh = [], []
+            for c in chosen_countries:
+                cnt = db_count_by_country(conn, c)
+                (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
 
-            st_status.update(
-                label=f"Cache aggiornata. Notizie disponibili (cache ≤{cfg.PRUNE_DAYS}gg): {len(items_cache_60d)} | Stream: {len(items_stream_30d)}",
-                state="complete"
-            )
+            items_new = []
+            if fresh:
+                items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
+            if warm:
+                items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
+
+            if items_new:
+                db_upsert(conn, items_new)
+                db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
+
+            items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+
+            # fallback se base DB è scarsa (come nel main del macro)
+            if len(items_ctx) < 20:
+                items_all = scraper.scrape_30d(chosen_countries, max_days=cfg.CONTEXT_DAYS)
+                if items_all:
+                    db_upsert(conn, items_all)
+                    items_ctx = db_load_recent(conn, chosen_countries, max_age_days=cfg.CONTEXT_DAYS)
+
+            sst.update(label=f"Base pronta: {len(items_ctx)} notizie nel contesto (≤{cfg.CONTEXT_DAYS}gg).", state="complete")
         except Exception as e:
             st.exception(e)
             st.stop()
 
-    items_ctx = items_cache_60d if items_cache_60d else items_stream_30d
     if not items_ctx:
-        st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
+        st.error("❌ Nessuna notizia disponibile entro la finestra.")
         st.stop()
 
-    # Executive Summary (IT, con fallback)
+    # ==== Executive Summary (firma: (context_items, cfg, chosen_countries)) ====
     st.info("Genero l’Executive Summary…")
     es_error = None
     es_text = ""
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
-        pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
-        cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
-        es_raw = call_once_per_run(cache_key, lambda: _retryable(
-            summarizer.executive_summary, items_ctx, cfg
-        ))
-        # traduzione in italiano
-        es_text = call_once_per_run(f"es_it::{hash(es_raw)}", lambda: _retryable(
-            summarizer.translate_it, es_raw
-        ))
+        es_text = call_once_per_run(
+            f"es::{len(items_ctx)}::{','.join(chosen_countries)}::{cfg.CONTEXT_DAYS}",
+            lambda: _retryable(summarizer.executive_summary, items_ctx, cfg, chosen_countries)
+        )
     except Exception as e:
         es_error = str(e)
         es_text = "Executive Summary non disponibile per errore di generazione."
+
     st.subheader("Executive Summary")
     if es_error:
         st.error(f"Motivo errore ES: {es_error}")
     st.write(es_text)
 
-    # Selezione
+    # ==== Selezione (ultimi N giorni) ====
     st.info(f"Costruisco la selezione (ultimi {int(days)} giorni)…")
     try:
-        selection_items = build_selection(
-            items_stream=items_stream_30d,
-            items_cache=items_cache_60d,
-            days_N=int(days),
-            max_news=cfg.MAX_NEWS
-        )
+        selection_items = build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
     except Exception as e:
-        # fallback duro se anche la nostra wrapper fallisce
-        selection_items = _simple_selection_fallback(items_stream_30d, items_cache_60d, int(days), cfg.MAX_NEWS)
-        st.warning(f"Selezione: uso fallback locale per un errore: {e}")
+        st.exception(e)
+        st.stop()
 
-    # Ri-traduzioni/riassunti in IT con fallback
+    # ==== Traduzione titoli + riassunti IT (signature del macro agent) ====
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
     for i, it in enumerate(selection_items, 1):
+        # Piccolo delay per “levigare” il rate
+        if i > 1:
+            time.sleep(0.4)
+
         # Titolo IT
         try:
-            it["title_it"] = call_once_per_run(f"ti::{hash(it.get('title',''))}", lambda: _retryable(
-                summarizer.translate_it, it.get("title","")
-            ))
+            it["title_it"] = call_once_per_run(
+                f"ti::{hash(it.get('title',''))}",
+                lambda: _retryable(summarizer.translate_it, it.get("title",""), cfg)
+            )
         except Exception:
             it["title_it"] = it.get("title","") or ""
-        # Riassunto IT con fallback
+
+        # Riassunto IT (se fallisce, fallback: description originale)
         try:
             it["summary_it"] = call_once_per_run(
                 f"si::{hash((it.get('title',''), it.get('time','')))}",
-                lambda: _retryable(summarizer.summarize_it, it)
+                lambda: _retryable(summarizer.summarize_item_it, it, cfg)
             )
-            if not it["summary_it"] or len(it["summary_it"]) < 40:
-                raise RuntimeError("Riassunto troppo corto, uso fallback traduzione description")
+            if not it["summary_it"] or len(it["summary_it"].strip()) < 30:
+                raise RuntimeError("Riassunto troppo corto")
         except Exception:
-            desc = it.get("description", "") or it.get("title", "")
-            try:
-                it["summary_it"] = call_once_per_run(
-                    f"si_fallback::{hash(desc)}",
-                    lambda: _retryable(summarizer.translate_it, desc)
-                )
-            except Exception:
-                it["summary_it"] = (it.get("title_it") or it.get("title") or "Sintesi non disponibile.")
+            it["summary_it"] = (it.get("description","") or "")
 
-        time.sleep(0.15)
         prog.progress(i / total)
 
     st.success("✅ Pipeline completata.")
 
-    # Anteprima
+    # ==== Anteprima tabellare
     with st.expander("Anteprima Selezione"):
         try:
             import pandas as pd
@@ -328,20 +263,15 @@ if run_btn:
         except Exception:
             st.info("Anteprima non disponibile (pandas mancante).")
 
-    # Report DOCX
+    # ==== Report DOCX (firma con context_count)
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
         out_path = save_report(
-            filename,
-            es_text,
-            selection_items,
-            chosen_norm,
-            int(days),
-            os.environ.get("OUTPUT_DIR", "reports"),
+            filename, es_text, selection_items, chosen_countries,
+            int(days), len(items_ctx), cfg.OUTPUT_DIR
         )
         st.info(f"Report salvato su disco: `{out_path}`")
-        # download
         try:
             data = Path(out_path).read_bytes()
             st.download_button(
@@ -357,7 +287,6 @@ if run_btn:
 
     # Riepilogo
     st.write("---")
-    st.write(f"**Notizie totali in cache (≤{cfg.PRUNE_DAYS} gg):** {len(items_cache_60d)}")
-    st.write(f"**Notizie da stream (≤{max(cfg.CONTEXT_DAYS_ES,int(days))} gg):** {len(items_stream_30d)}")
+    st.write(f"**Notizie totali nel contesto (≤{cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
     st.write(f"**Notizie selezionate (ultimi {int(days)} gg):** {len(selection_items)}")
     st.caption(f"Esecuzione: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
