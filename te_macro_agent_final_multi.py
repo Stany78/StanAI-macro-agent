@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # te_macro_agent_auto_select_unified.py
-# ES: finestra 60gg (invariato nello stile, con fix "%").
+# ES: finestra 60gg (invariato nello stile, con fix "%").ciao
 # NOTIZIE: tassonomia unificata, dedup/merge PCE, fallback colore, cap/quote, cap rendimenti=1,
 # fill-up a MIN_TARGET=12 (prima ≤N giorni, poi estendi a N+10 e fino a 30 giorni dal DB),
 # ordinamento finale Colore ↓, Score ↓, Recency ↑.
