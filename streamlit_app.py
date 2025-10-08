@@ -1,7 +1,7 @@
-# streamlit_app.py — bootstrap Playwright + retry Anthropic + pacing adattivo ES
-# - NON modifica la logica del modulo beta
-# - ES: input identico al locale (usa items_ctx, nessun filtro/troncatura)
-# - Aggiunge: ensure_playwright_chromium(), retry/backoff 429, single-flight anti-rerun, pacing prima dell'ES
+# streamlit_app.py — compat con te_macro_agent_final_multi.py (NO changes to macro agent)
+# - Non tocca la logica del modulo beta
+# - Allinea gli import e le chiamate alle funzioni effettivamente esposte dal modulo
+# - Mantiene bootstrap Playwright, retry/backoff e pacing "gentile"
 
 import os
 import sys
@@ -25,7 +25,7 @@ if sys.platform.startswith("win"):
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Import del modulo beta (NON MODIFICATO)
+# Import del modulo macro agent (NON MODIFICATO)
 # ──────────────────────────────────────────────────────────────────────────────
 import te_macro_agent_final_multi as beta
 from te_macro_agent_final_multi import (
@@ -33,10 +33,12 @@ from te_macro_agent_final_multi import (
     setup_logging,
     TEStreamScraper,
     MacroSummarizer,
-    build_selection,
-    save_report,
+    # Selezione
+    build_selection_freshfirst,
     # DB helpers
-    db_init, db_upsert, db_count_by_country, db_load_recent, db_prune,
+    db_init, db_upsert, db_load, db_prune,
+    # Report
+    save_report,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,7 +207,7 @@ if run_btn:
     chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen_countries]
 
     st.write(
-        f"▶ **Contesto ES:** {cfg.CONTEXT_DAYS} giorni | **Selezione:** {days} giorni | **Paesi:** {', '.join(chosen_norm)}"
+        f"▶ **ES (contesto)**: {cfg.CONTEXT_DAYS_ES} giorni | **Selezione**: {days} giorni | **Paesi**: {', '.join(chosen_norm)}"
     )
 
     # Assicura playwright+chromium PRIMA di qualunque launch()
@@ -213,57 +215,38 @@ if run_btn:
         ensure_playwright_chromium()
         st_status.update(label="Browser pronto", state="complete")
 
-    # Pipeline DB/Delta Mode (identica alla logica CLI del beta)
-    items_ctx: List[Dict[str, Any]] = []
-
+    # Scrape per aggiornare DB (fino a 30 gg per ES)
     with st.status("Aggiornamento cache locale e caricamento notizie…", expanded=False) as st_status:
         try:
-            if cfg.DELTA_MODE:
+            scraper = TEStreamScraper(cfg)
+            items_stream_30d: List[Dict[str, Any]] = scraper.scrape_stream(
+                chosen_norm, horizon_days=max(cfg.CONTEXT_DAYS_ES, int(days))
+            )
+
+            if cfg.USE_DB:
                 conn = db_init(cfg.DB_PATH)
-
-                warm, fresh = [], []
-                for c in chosen_norm:
-                    cnt = db_count_by_country(conn, c)
-                    (warm if cnt >= cfg.WARMUP_NEW_COUNTRY_MIN else fresh).append(c)
-
-                scraper = TEStreamScraper(cfg)
-                items_new: List[Dict[str, Any]] = []
-
-                # Fresh countries → scraping ampia finestra ES
-                if fresh:
-                    items_new += scraper.scrape_30d(fresh, max_days=cfg.CONTEXT_DAYS)
-
-                # Warm countries → delta scrape corto
-                if warm:
-                    items_new += scraper.scrape_30d(warm, max_days=min(cfg.SCRAPE_HORIZON_DAYS, cfg.CONTEXT_DAYS))
-
-                if items_new:
-                    db_upsert(conn, items_new)
-                    db_prune(conn, max_age_days=cfg.PRUNE_DAYS)
-
-                # Carica dal DB
-                items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS)
-
-                # Fallback: base scarsa → scrape completo finestra ES
-                if len(items_ctx) < 20:
-                    all_new = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS)
-                    if all_new:
-                        db_upsert(conn, all_new)
-                        items_ctx = db_load_recent(conn, chosen_norm, max_age_days=cfg.CONTEXT_DAYS)
+                if items_stream_30d:
+                    db_upsert(conn, items_stream_30d)
+                    db_prune(conn, cfg.PRUNE_DAYS)
+                items_cache_60d = db_load(conn, chosen_norm, max_age_days=cfg.PRUNE_DAYS)
             else:
-                scraper = TEStreamScraper(cfg)
-                items_ctx = scraper.scrape_30d(chosen_norm, max_days=cfg.CONTEXT_DAYS)
+                items_cache_60d = []
 
-            st_status.update(label=f"Cache aggiornata. Notizie disponibili (finestra {cfg.CONTEXT_DAYS}gg): {len(items_ctx)}", state="complete")
+            st_status.update(
+                label=f"Cache aggiornata. Notizie disponibili (cache ≤{cfg.PRUNE_DAYS}gg): {len(items_cache_60d)} | Stream: {len(items_stream_30d)}",
+                state="complete"
+            )
         except Exception as e:
             st.exception(e)
             st.stop()
 
+    # Scegli contesto per ES come nel CLI del beta
+    items_ctx = items_cache_60d if items_cache_60d else items_stream_30d
     if not items_ctx:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary — **identico al locale** (stessi input items_ctx)
+    # Executive Summary — **identico alla CLI** (stessi input items_ctx)
     st.info("Genero l’Executive Summary…")
     try:
         summarizer = MacroSummarizer(cfg.ANTHROPIC_API_KEY, cfg.MODEL, cfg.MODEL_TEMP, cfg.MAX_TOKENS)
@@ -272,9 +255,9 @@ if run_btn:
         pace_before_big_request(items_ctx, label="Preparazione Executive Summary…")
 
         # chiave cache solo anti-rerun; input invariato
-        es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS}"
+        es_cache_key = f"es::{len(items_ctx)}::{','.join(chosen_norm)}::{cfg.CONTEXT_DAYS_ES}"
         es_text = call_once_per_run(es_cache_key, lambda: _retryable(
-            summarizer.executive_summary, items_ctx, cfg, chosen_norm
+            summarizer.executive_summary, items_ctx, cfg
         ))
     except Exception as e:
         st.exception(e)
@@ -283,12 +266,15 @@ if run_btn:
     st.subheader("Executive Summary")
     st.write(es_text)
 
-    # Selezione ultimi N giorni (+ fill-up) — come da beta
-    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, con fill-up se necessario)…")
+    # Selezione Fresh-first (N×24h) — come da beta
+    st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, colore-first hard)…")
     try:
-        selection_items = build_selection(items_ctx, int(days), cfg, expand1_days=10, expand2_days=30)
-    except TypeError:
-        selection_items = build_selection(items_ctx, int(days), cfg)
+        selection_items = build_selection_freshfirst(
+            items_stream=items_stream_30d,
+            items_cache=items_cache_60d,
+            days_N=int(days),
+            max_news=cfg.MAX_NEWS
+        )
     except Exception as e:
         st.exception(e)
         st.stop()
@@ -302,15 +288,15 @@ if run_btn:
         # Traduzione titolo (retry 429)
         try:
             it["title_it"] = call_once_per_run(f"ti::{hash(it.get('title',''))}", lambda: _retryable(
-                summarizer.translate_it, it.get("title",""), cfg
+                summarizer.translate_it, it.get("title","")
             ))
         except Exception:
             it["title_it"] = it.get("title","") or ""
 
-        # Riassunto IT (retry 429)
+        # Riassunto IT (retry 429) — metodo: summarize_it
         try:
             it["summary_it"] = call_once_per_run(f"si::{hash((it.get('title',''), it.get('time','')))}", lambda: _retryable(
-                summarizer.summarize_item_it, it, cfg
+                summarizer.summarize_it, it
             ))
         except Exception:
             it["summary_it"] = (it.get("description","") or "")
@@ -342,14 +328,14 @@ if run_btn:
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
+        # save_report signature: (filename, es_text, sel, countries, days_N, out_dir)
         out_path = save_report(
-            filename=filename,
-            es_text=es_text,
-            selection=selection_items,
-            countries=chosen_norm,
-            days=int(days),
-            context_count=len(items_ctx),
-            output_dir=cfg.OUTPUT_DIR,
+            filename,
+            es_text,
+            selection_items,
+            chosen_norm,
+            int(days),
+            cfg.OUTPUT_DIR,
         )
         st.info(f"Report salvato su disco: `{out_path}`")
 
@@ -370,6 +356,7 @@ if run_btn:
 
     # Riepilogo
     st.write("---")
-    st.write(f"**Notizie totali nel DB (ultimi {cfg.CONTEXT_DAYS} gg):** {len(items_ctx)}")
-    st.write(f"**Notizie selezionate (ultimi {int(days)} gg + fill-up):** {len(selection_items)}")
+    st.write(f"**Notizie totali in cache (≤{cfg.PRUNE_DAYS} gg):** {len(items_cache_60d)}")
+    st.write(f"**Notizie da stream (≤{max(cfg.CONTEXT_DAYS_ES,int(days))} gg):** {len(items_stream_30d)}")
+    st.write(f"**Notizie selezionate (ultimi {int(days)} gg):** {len(selection_items)}")
     st.caption(f"Esecuzione: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
