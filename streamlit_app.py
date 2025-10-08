@@ -8,142 +8,113 @@ import asyncio
 import subprocess
 import time
 import logging
-import shutil
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 import streamlit as st
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_message
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Compatibilità event loop Windows (no-op in Cloud)
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Import del modulo beta (NON MODIFICATO)
-# ────────────────────────────────────────────────────────────────────────────────
-import te_macro_agent_final_multi as beta
-from te_macro_agent_final_multi import (
-    Config,
-    setup_logging,
-    TEStreamScraper,
-    MacroSummarizer,
-    build_selection,
-    save_report,
-    # DB helpers
-    db_init, db_upsert, db_count_by_country, db_load_recent, db_prune,
-)
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Playwright & OS deps bootstrap (idempotente + cache_resource)
+# Import del modulo beta (NON MODIFICATO) — robusto con diagnostica
 # ────────────────────────────────────────────────────────────────────────────────
+import importlib
+from types import ModuleType
 
-REQUIRED_APT_DEPS: List[str] = [
-    "libnss3",
-    "libnspr4",
-    "libatk1.0-0",
-    "libatk-bridge2.0-0",
-    "libcups2",
-    "libdrm2",
-    "libxkbcommon0",
-    "libxcomposite1",
-    "libxdamage1",
-    "libxfixes3",
-    "libxrandr2",
-    "libgbm1",
-    "libpango-1.0-0",
-    "libcairo2",
-    "libasound2",
-    "libatspi2.0-0",
+# Assicura che la cartella del progetto sia nel PYTHONPATH
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+def _import_beta_module() -> ModuleType:
+    try:
+        return importlib.import_module("te_macro_agent_final_multi")
+    except Exception as e:
+        st.error(
+            "Impossibile importare `te_macro_agent_final_multi.py`"
+            "Verifica che il file esista nella stessa cartella dell'app e che i requisiti siano installati."
+            f"Dettagli import: {type(e).__name__}: {e}"
+        )
+        st.stop()
+
+beta = _import_beta_module()
+
+# Estrai simboli richiesti e valida che esistano
+required_symbols = [
+    "Config", "setup_logging", "TEStreamScraper", "MacroSummarizer",
+    "build_selection", "save_report",
+    "db_init", "db_upsert", "db_count_by_country", "db_load_recent", "db_prune",
 ]
+_missing = [name for name in required_symbols if not hasattr(beta, name)]
+if _missing:
+    st.error(
+        "Il modulo `te_macro_agent_final_multi` è stato importato, ma mancano i seguenti simboli:"
+        + ", ".join(_missing) +
+        "\n\nAllinea le versioni o aggiorna il file in modo che esponga tali funzioni/classi."
+    )
+    st.stop()
 
-def _is_root() -> bool:
-    try:
-        return os.geteuid() == 0
-    except Exception:
-        return False
+# Bind locali
+Config = getattr(beta, "Config")
+setup_logging = getattr(beta, "setup_logging")
+TEStreamScraper = getattr(beta, "TEStreamScraper")
+MacroSummarizer = getattr(beta, "MacroSummarizer")
+build_selection = getattr(beta, "build_selection")
+save_report = getattr(beta, "save_report")
+db_init = getattr(beta, "db_init")
+db_upsert = getattr(beta, "db_upsert")
+db_count_by_country = getattr(beta, "db_count_by_country")
+db_load_recent = getattr(beta, "db_load_recent")
+db_prune = getattr(beta, "db_prune")
 
-def _check_missing_apt() -> List[str]:
-    if not (sys.platform.startswith("linux") and shutil.which("dpkg")):
-        return []
-    missing = []
-    for pkg in REQUIRED_APT_DEPS:
-        rc = subprocess.call(["dpkg", "-s", pkg],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if rc != 0:
-            missing.append(pkg)
-    return missing
 
-def _apt_install(pkgs: List[str]) -> Tuple[bool, str]:
-    try:
-        subprocess.check_call(["apt-get", "update"])
-        subprocess.check_call(["apt-get", "install", "-y"] + pkgs)
-        return True, "OK"
-    except subprocess.CalledProcessError as e:
-        return False, str(e)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Bootstrap Playwright (libreria + browser) — idempotente e cache-ato
+# ──────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_chromium() -> None:
     """
     Garantisce che:
-      1) (Linux) le librerie di sistema Playwright siano presenti (se possibile le installa)
-      2) il pacchetto Python 'playwright' sia installato
-      3) i binari Chromium siano scaricati in ~/.cache/ms-playwright
+      1) il modulo Python 'playwright' sia disponibile
+      2) i binari Chromium siano installati in ~/.cache/ms-playwright
     È idempotente e veloce ai run successivi.
     """
-    # 0) Linux/Debian-like: prova a garantire le deps di sistema
-    if sys.platform.startswith("linux") and shutil.which("apt-get"):
-        missing = _check_missing_apt()
-        if missing:
-            if _is_root():
-                with st.status("Installazione dipendenze di sistema per Playwright…", expanded=False):
-                    ok, msg = _apt_install(missing)
-                    if not ok:
-                        st.error(
-                            "Installazione automatica delle librerie di sistema fallita.\n\n"
-                            "Comando equivalente:\n\n"
-                            f"```bash\napt-get update && apt-get install -y {' '.join(missing)}\n```"
-                        )
-                        st.stop()
-            else:
-                st.warning(
-                    "Questo host Linux **non** ha alcune librerie richieste per avviare i browser di Playwright "
-                    "e il processo non ha permessi per installarle.\n\n"
-                    "Esegui sul tuo host (con privilegi elevati):\n\n"
-                    f"```bash\nsudo apt-get update && sudo apt-get install {' '.join(missing)}\n```\n"
-                    "In alternativa:\n\n"
-                    "```bash\nsudo playwright install-deps\n```"
-                )
-                st.stop()
-
-    # 1) Installa la libreria Python se assente
+    # 1) Installa la libreria se assente
     try:
         import playwright  # noqa: F401
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
 
-    # 2) Imposta il path browsers e verifica presenza Chromium
+    # 2) Imposta la path vista nei log di errore
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
+
     base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
     chromium_present = base.exists() and any(p.name.startswith("chromium") for p in base.glob("chromium-*"))
 
-    # 3) Se non presente, scaricalo (prima con --with-deps, poi fallback)
+    # 3) Se Chromium non è presente, scaricalo (prima con --with-deps, poi fallback)
     if not chromium_present:
         try:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
         except subprocess.CalledProcessError:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Helper: retry 429 Anthropic + single-flight + pacing + silenzia log 429
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 def _retryable(fn, *args, **kwargs):
     """
     Esegue fn con retry/backoff sui classici errori 429 / rate limit di Anthropic.
@@ -220,9 +191,9 @@ def suppress_rate_limit_logs():
     finally:
         root.removeFilter(flt)
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # UI
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
 st.title("📈 StanAI Macro Agent")
 
@@ -272,9 +243,9 @@ with right:
 
 st.divider()
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Esecuzione
-# ────────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
     # Log base
     setup_logging()
@@ -298,25 +269,8 @@ if run_btn:
 
     # Assicura playwright+chromium PRIMA di qualunque launch()
     with st.status("Preparazione browser…", expanded=False) as st_status:
-        try:
-            ensure_playwright_chromium()
-            st_status.update(label="Browser pronto", state="complete")
-        except Exception as e:
-            msg = str(e)
-            banner = "Host system is missing dependencies to run browsers"
-            if banner in msg:
-                st.error(
-                    "Playwright non può avviare il browser perché mancano librerie di sistema sull'host.\n\n"
-                    "Soluzione consigliata sull'host:\n\n"
-                    "```bash\nsudo apt-get update && sudo apt-get install \\n"
-                    "libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 "
-                    "libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 "
-                    "libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0\n```\n"
-                    "Oppure: `sudo playwright install-deps`"
-                )
-                st.stop()
-            else:
-                raise
+        ensure_playwright_chromium()
+        st_status.update(label="Browser pronto", state="complete")
 
     # Pipeline DB/Delta Mode (identica alla logica CLI del beta)
     items_ctx: List[Dict[str, Any]] = []
@@ -361,23 +315,8 @@ if run_btn:
 
             st_status.update(label=f"Cache aggiornata. Notizie disponibili (finestra {cfg.CONTEXT_DAYS}gg): {len(items_ctx)}", state="complete")
         except Exception as e:
-            # Messaggio specifico per dipendenze Playwright mancanti
-            msg = str(e)
-            banner = "Host system is missing dependencies to run browsers"
-            if banner in msg:
-                st.error(
-                    "Playwright non può avviare il browser perché mancano librerie di sistema sull'host.\n\n"
-                    "Soluzione consigliata sull'host:\n\n"
-                    "```bash\nsudo apt-get update && sudo apt-get install \\n"
-                    "libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 "
-                    "libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 "
-                    "libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0\n```\n"
-                    "Oppure: `sudo playwright install-deps`"
-                )
-                st.stop()
-            else:
-                st.exception(e)
-                st.stop()
+            st.exception(e)
+            st.stop()
 
     if not items_ctx:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
