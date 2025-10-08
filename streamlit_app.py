@@ -1,5 +1,5 @@
-# streamlit_app.py — robust Streamlit UI with Playwright preflight and Anthropic retry
-# Preserva la logica del modulo beta, con messaggi chiari e fallback minimi.
+# streamlit_app.py — Streamlit UI robusta con preflight Playwright e retry Anthropic
+# Mantiene la logica del modulo beta e corregge i problemi di stringhe / messaggi.
 
 import os
 import sys
@@ -26,7 +26,7 @@ if sys.platform.startswith("win"):
         pass
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Import modulo beta con diagnostica + compatiblità versioni
+# Import modulo beta con diagnostica chiara
 # ────────────────────────────────────────────────────────────────────────────────
 import importlib
 from types import ModuleType
@@ -40,20 +40,19 @@ def _import_beta() -> ModuleType:
     try:
         return importlib.import_module("te_macro_agent_final_multi")
     except Exception as e:
-        st.error(
-            "Impossibile importare `te_macro_agent_final_multi.py`.
+        st.error(f"""
+### ❌ Errore durante l'import del modulo `te_macro_agent_final_multi.py`
 
-"
-            "Assicurati che il file sia nella stessa cartella dell'app e che le dipendenze siano installate.
+Assicurati che:
+- il file sia nella stessa cartella dell'app Streamlit
+- tutte le dipendenze del modulo siano installate
 
-"
-            f"Dettagli: {type(e).__name__}: {e}"
-        )
+**Dettagli:** {type(e).__name__}: {e}
+""")
         st.stop()
 
 beta = _import_beta()
 
-# Simboli essenziali
 ESSENTIAL = ["Config","setup_logging","TEStreamScraper","MacroSummarizer","save_report","db_init","db_upsert","db_prune"]
 missing = [n for n in ESSENTIAL if not hasattr(beta, n)]
 if missing:
@@ -70,7 +69,7 @@ db_init = getattr(beta, "db_init")
 db_upsert = getattr(beta, "db_upsert")
 db_prune = getattr(beta, "db_prune")
 
-# Opzionali (gli adapter sono stati aggiunti nel modulo)
+# Opzionali (gli adapter possono essere nel modulo)
 build_selection = getattr(beta, "build_selection", None)
 db_count_by_country = getattr(beta, "db_count_by_country", None)
 db_load_recent = getattr(beta, "db_load_recent", None)
@@ -86,7 +85,7 @@ REQUIRED_APT = [
 
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_chromium() -> None:
-    # Linux: verifica librerie APT (se possibile)
+    # Linux: verifica librerie di sistema
     if sys.platform.startswith("linux") and shutil.which("apt-get") and shutil.which("dpkg"):
         missing = []
         for pkg in REQUIRED_APT:
@@ -101,24 +100,28 @@ def ensure_playwright_chromium() -> None:
             if is_root:
                 with st.status("Installazione librerie di sistema Playwright…", expanded=False):
                     subprocess.check_call(["apt-get","update"])
-                    subprocess.check_call(["apt-get","install","-y"]+missing)
+                    subprocess.check_call(["apt-get","install","-y"] + missing)
             else:
-                st.error(
-                    "Mancano librerie di sistema per Playwright.
+                st.error(f"""
+Playwright non può avviare Chromium perché mancano librerie di sistema sull'host.
 
-"
-                    "Esegui sull'host:
+Esegui sul terminale:
 
-"
-                    f"```bash\nsudo apt-get update && sudo apt-get install {' '.join(missing)}\n```
-"
-                    "Oppure: `sudo playwright install-deps`"
-                )
+```bash
+sudo apt-get update && sudo apt-get install \\
+{' '.join(missing)}
+```
+
+Oppure:
+```bash
+sudo playwright install-deps
+```
+""")
                 st.stop()
 
     # pacchetto Python
     try:
-        import playwright  # noqa
+        import playwright  # noqa: F401
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable,"-m","pip","install","playwright==1.48.0"])
 
@@ -138,7 +141,7 @@ def ensure_playwright_chromium() -> None:
 def _retryable(fn, *args, **kwargs):
     @retry(
         reraise=True,
-        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit)"),
+        retry=retry_if_exception_message(match=r"(?i)(429|rate[_\\s-]?limit|acceleration limit)"),
         wait=wait_exponential(multiplier=1.5, min=2, max=30),
         stop=stop_after_attempt(5),
     )
@@ -283,19 +286,23 @@ if run_btn:
         except Exception as e:
             msg = str(e)
             if "Host system is missing dependencies to run browsers" in msg:
-                st.error(
-                    "Playwright non può avviare il browser perché mancano librerie di sistema sull'host.
+                st.error("""
+Playwright non può avviare il browser perché mancano librerie di sistema sull'host.
 
-"
-                    "Esegui:
+Esegui:
 
-```bash\nsudo apt-get update && sudo apt-get install \\n"
-                    "libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 "
-                    "libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 "
-                    "libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0\n```
-"
-                    "Oppure: `sudo playwright install-deps`"
-                )
+```bash
+sudo apt-get update && sudo apt-get install \
+libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0
+```
+
+Oppure:
+```bash
+sudo playwright install-deps
+```
+""")
             else:
                 st.exception(e)
             st.stop()
