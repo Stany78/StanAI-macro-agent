@@ -1,9 +1,5 @@
-# streamlit_app.py — Revisione totale (solo Streamlit) compatibile con te_macro_agent_final_multi.py
-# - Non tocca il macro agent: usa esclusivamente le API esposte dal modulo
-# - Executive Summary forzato in IT (se disponibile), diagnostica errori chiara
-# - Riassunti delle notizie in IT con fallback a traduzione automatica della description
-# - Bootstrap Playwright idempotente, retry/backoff 429, pacing adattivo
-# - UI semplice, report DOCX scaricabile
+# streamlit_app.py — versione che usa esplicitamente Streamlit Secrets per API key e path
+# (contenuto identico al precedente tentativo; ripubblicato)
 
 import os
 import sys
@@ -17,69 +13,42 @@ from typing import List, Dict, Any
 import streamlit as st
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_message
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Compatibilità event loop Windows (no-op in Cloud)
-# ──────────────────────────────────────────────────────────────────────────────
-if sys.platform.startswith("win"):
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Import del modulo macro agent (NON MODIFICATO)
-# ──────────────────────────────────────────────────────────────────────────────
 from te_macro_agent_final_multi import (
     Config,
     setup_logging,
     TEStreamScraper,
     MacroSummarizer,
-    # Selezione
     build_selection_freshfirst,
-    # DB helpers
     db_init, db_upsert, db_load, db_prune,
-    # Report
     save_report,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Bootstrap Playwright (libreria + browser) — idempotente e cache-ato
-# ──────────────────────────────────────────────────────────────────────────────
+def _apply_secrets_to_env():
+    if "ANTHROPIC_API_KEY" in st.secrets:
+        os.environ["ANTHROPIC_API_KEY"] = str(st.secrets["ANTHROPIC_API_KEY"]).strip()
+    if "DB_PATH" in st.secrets:
+        os.environ["DB_PATH"] = str(st.secrets["DB_PATH"]).strip()
+    if "OUTPUT_DIR" in st.secrets:
+        os.environ["OUTPUT_DIR"] = str(st.secrets["OUTPUT_DIR"]).strip()
+
+_apply_secrets_to_env()
+
 @st.cache_resource(show_spinner=False)
 def ensure_playwright_chromium() -> None:
-    """
-    Garantisce che:
-      1) il modulo Python 'playwright' sia disponibile
-      2) i binari Chromium siano installati in ~/.cache/ms-playwright
-    È idempotente e veloce ai run successivi.
-    """
-    # 1) Installa la libreria se assente
     try:
         import playwright  # noqa: F401
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright==1.48.0"])
-
-    # 2) Imposta la path vista nei log di errore
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(Path.home() / ".cache" / "ms-playwright"))
-
     base = Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
     chromium_present = base.exists() and any(p.name.startswith("chromium") for p in base.glob("chromium-*"))
-
-    # 3) Se Chromium non è presente, scaricalo (prima con --with-deps, poi fallback)
     if not chromium_present:
         try:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"])
         except subprocess.CalledProcessError:
             subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helper: retry 429 Anthropic + single-flight + pacing adattivo (senza cambiare input)
-# ──────────────────────────────────────────────────────────────────────────────
 def _retryable(fn, *args, **kwargs):
-    """
-    Esegue fn con retry/backoff sui classici errori 429 / rate limit di Anthropic.
-    Non cambia l'input né l'output del modello: solo ritenta.
-    """
     @retry(
         reraise=True,
         retry=retry_if_exception_message(match=r"(?i)(429|rate[_\s-]?limit|acceleration limit|Too Many Requests)"),
@@ -91,10 +60,6 @@ def _retryable(fn, *args, **kwargs):
     return _call()
 
 def call_once_per_run(cache_key: str, caller):
-    """
-    Evita invii doppi dovuti a rerun di Streamlit.
-    Se nel run corrente abbiamo già calcolato cache_key, ritorna il valore cached.
-    """
     if "api_once_cache" not in st.session_state:
         st.session_state.api_once_cache = {}
     if cache_key in st.session_state.api_once_cache:
@@ -104,7 +69,6 @@ def call_once_per_run(cache_key: str, caller):
     return val
 
 def _rough_token_estimate(items):
-    """Stima grossolana dei token in input (~1 token ogni 4 caratteri)."""
     total_chars = 0
     for it in items:
         total_chars += len(it.get("title", "") or "")
@@ -112,116 +76,77 @@ def _rough_token_estimate(items):
     return max(1, total_chars // 4)
 
 def pace_before_big_request(items, label="Preparazione Executive Summary…"):
-    """
-    Attesa adattiva prima di inviare richieste molto grandi, per rientrare
-    nel rate limit 'acceleration' di Anthropic senza cambiare l'input.
-    """
     est_tokens = _rough_token_estimate(items)
-    if est_tokens < 30000:
-        wait_s = 0
-    elif est_tokens < 60000:
-        wait_s = 8
-    elif est_tokens < 90000:
-        wait_s = 18
-    else:
-        wait_s = 30
-
-    if wait_s <= 0:
-        return
-
+    if   est_tokens < 30000: wait_s = 0
+    elif est_tokens < 60000: wait_s = 8
+    elif est_tokens < 90000: wait_s = 18
+    else:                    wait_s = 30
+    if wait_s <= 0: return
     with st.status(f"{label} (attendo {wait_s}s per evitare 429)…", expanded=False) as s:
         for sec in range(wait_s, 0, -1):
             s.update(label=f"{label} (attendo {sec}s)…")
             time.sleep(1)
         s.update(label="Invio ora la richiesta…", state="complete")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UI
-# ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="StanAI Macro Agent", page_icon="📈", layout="wide")
-st.title("📈 StanAI Macro Agent — Dashboard")
+st.title("📈 StanAI Macro Agent — Secrets Mode")
+
+key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+masked = f"{key[:6]}…{key[-4:]} (len={len(key)})" if key else "—"
+st.caption(f"ANTHROPIC_API_KEY caricata: {masked}")
+if not key or not key.startswith("sk-ant-"):
+    st.error("Chiave Anthropic mancante o nel formato sbagliato (attesa: 'sk-ant-…'). Correggi i Secrets e premi Rerun.")
+    st.stop()
 
 left, right = st.columns([1, 2], gap="large")
-
 with left:
-    days = st.number_input(
-        "Giorni da mostrare nella SELEZIONE",
-        min_value=1, max_value=30, value=5, step=1
-    )
+    days = st.number_input("Giorni da mostrare nella SELEZIONE", min_value=1, max_value=30, value=5, step=1)
     run_btn = st.button("Esegui pipeline")
-
 with right:
     st.markdown("**Seleziona i Paesi:**")
     countries_all = [
         "United States", "Euro Area", "Germany", "United Kingdom",
         "Italy", "France", "China", "Japan", "Spain", "Netherlands", "European Union"
     ]
-
     c1, c2 = st.columns(2)
-    with c1:
-        select_all = st.button("Seleziona tutti")
-    with c2:
-        deselect_all = st.button("Deseleziona tutti")
-
+    with c1: select_all = st.button("Seleziona tutti")
+    with c2: deselect_all = st.button("Deseleziona tutti")
     if "country_flags" not in st.session_state:
         st.session_state.country_flags = {c: False for c in countries_all}
-
     if select_all:
-        for c in countries_all:
-            st.session_state.country_flags[c] = True
+        for c in countries_all: st.session_state.country_flags[c] = True
     if deselect_all:
-        for c in countries_all:
-            st.session_state.country_flags[c] = False
-
+        for c in countries_all: st.session_state.country_flags[c] = False
     cols = st.columns(2)
     for i, country in enumerate(countries_all):
         col = cols[i % 2]
         st.session_state.country_flags[country] = col.checkbox(
-            country,
-            value=st.session_state.country_flags.get(country, False),
-            key=f"chk_{country}"
+            country, value=st.session_state.country_flags.get(country, False), key=f"chk_{country}"
         )
-
     chosen_countries = [c for c, v in st.session_state.country_flags.items() if v]
 
 st.divider()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Esecuzione
-# ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
     setup_logging()
     cfg = Config()
-
-    # API Key
-    if not cfg.ANTHROPIC_API_KEY:
-        st.error("❌ Nessuna ANTHROPIC_API_KEY trovata nei Secrets o nel .env.")
-        st.stop()
 
     if not chosen_countries:
         st.warning("Seleziona almeno un Paese prima di eseguire.")
         st.stop()
 
-    # Normalizza “European Union” → “Euro Area”
     chosen_norm = ["Euro Area" if x == "European Union" else x for x in chosen_countries]
+    st.write(f"▶ **ES (contesto)**: {cfg.CONTEXT_DAYS_ES} giorni | **Selezione**: {days} giorni | **Paesi**: {', '.join(chosen_norm)}")
 
-    st.write(
-        f"▶ **ES (contesto)**: {cfg.CONTEXT_DAYS_ES} giorni | **Selezione**: {days} giorni | **Paesi**: {', '.join(chosen_norm)}"
-    )
-
-    # Playwright/Chromium
     with st.status("Preparazione browser…", expanded=False) as st_status:
         ensure_playwright_chromium()
         st_status.update(label="Browser pronto", state="complete")
 
-    # Scrape + DB
     with st.status("Aggiornamento cache locale e caricamento notizie…", expanded=False) as st_status:
         try:
             scraper = TEStreamScraper(cfg)
             horizon = max(cfg.CONTEXT_DAYS_ES, int(days))
-            items_stream_30d: List[Dict[str, Any]] = scraper.scrape_stream(
-                chosen_norm, horizon_days=horizon
-            )
+            items_stream_30d = scraper.scrape_stream(chosen_norm, horizon_days=horizon)
 
             if cfg.USE_DB:
                 conn = db_init(cfg.DB_PATH)
@@ -240,13 +165,11 @@ if run_btn:
             st.exception(e)
             st.stop()
 
-    # Contesto ES
     items_ctx = items_cache_60d if items_cache_60d else items_stream_30d
     if not items_ctx:
         st.error("❌ Nessuna notizia disponibile nella finestra temporale selezionata.")
         st.stop()
 
-    # Executive Summary con diagnostica + traduzione IT
     st.info("Genero l’Executive Summary…")
     es_error = None
     es_text = ""
@@ -265,7 +188,6 @@ if run_btn:
     if es_error:
         st.error(f"Motivo errore ES: {es_error}")
 
-    # Prova a tradurre in IT se l'ES è presente ma potrebbe essere in inglese
     try:
         if es_text and es_text.strip() and "non disponibile" not in es_text.lower():
             es_text_it = call_once_per_run(f"es_it::{hash(es_text)}", lambda: _retryable(
@@ -278,7 +200,6 @@ if run_btn:
 
     st.write(es_text)
 
-    # Selezione Fresh-first (N×24h)
     st.info(f"Costruisco la selezione (ultimi {int(days)} giorni, colore-first)…")
     try:
         selection_items = build_selection_freshfirst(
@@ -291,13 +212,11 @@ if run_btn:
         st.exception(e)
         st.stop()
 
-    # Traduzione titoli + Riassunti IT con fallback a traduzione description
     st.info("Traduco titoli e genero riassunti in italiano…")
     prog = st.progress(0.0)
     total = max(1, len(selection_items))
 
     for i, it in enumerate(selection_items, 1):
-        # Titolo IT
         try:
             it["title_it"] = call_once_per_run(f"ti::{hash(it.get('title',''))}", lambda: _retryable(
                 summarizer.translate_it, it.get("title","")
@@ -305,13 +224,11 @@ if run_btn:
         except Exception:
             it["title_it"] = it.get("title","") or ""
 
-        # Riassunto IT primario
         try:
             it["summary_it"] = call_once_per_run(
                 f"si::{hash((it.get('title',''), it.get('time','')))}",
                 lambda: _retryable(summarizer.summarize_it, it)
             )
-            # Se troppo corto, forza fallback
             if not it["summary_it"] or len(it["summary_it"]) < 40:
                 raise RuntimeError("Riassunto troppo corto, uso fallback traduzione description")
         except Exception:
@@ -329,7 +246,6 @@ if run_btn:
 
     st.success("✅ Pipeline completata.")
 
-    # Anteprima Selezione
     with st.expander("Anteprima Selezione"):
         try:
             import pandas as pd
@@ -347,36 +263,20 @@ if run_btn:
         except Exception:
             st.info("Anteprima non disponibile (pandas mancante).")
 
-    # Report DOCX
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"MacroAnalysis_AutoSelect_{int(days)}days_{ts}.docx"
-        out_path = save_report(
-            filename,
-            es_text,
-            selection_items,
-            chosen_norm,
-            int(days),
-            cfg.OUTPUT_DIR,
-        )
+        out_path = save_report(filename, es_text, selection_items, chosen_norm, int(days), os.environ.get("OUTPUT_DIR","reports"))
         st.info(f"Report salvato su disco: `{out_path}`")
-
-        # Download
         try:
             data = Path(out_path).read_bytes()
-            st.download_button(
-                "📥 Scarica report DOCX",
-                data=data,
-                file_name=Path(out_path).name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+            st.download_button("📥 Scarica report DOCX", data=data, file_name=Path(out_path).name,
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         except Exception as e:
             st.warning(f"Report creato ma non scaricabile ora: {e}")
-
     except Exception as e:
         st.error(f"Errore nella generazione/salvataggio DOCX: {e}")
 
-    # Riepilogo
     st.write("---")
     st.write(f"**Notizie totali in cache (≤{cfg.PRUNE_DAYS} gg):** {len(items_cache_60d)}")
     st.write(f"**Notizie da stream (≤{max(cfg.CONTEXT_DAYS_ES,int(days))} gg):** {len(items_stream_30d)}")
